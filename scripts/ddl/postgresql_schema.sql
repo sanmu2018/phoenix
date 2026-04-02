@@ -17,6 +17,8 @@ CREATE TABLE public.annotation_configs (
         UNIQUE (name)
 );
 
+ALTER SEQUENCE public.annotation_configs_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: generative_models
 -- ------------------------
@@ -49,6 +51,8 @@ CREATE TABLE public.project_trace_retention_policies (
     CONSTRAINT pk_project_trace_retention_policies PRIMARY KEY (id)
 );
 
+ALTER SEQUENCE public.project_trace_retention_policies_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: projects
 -- ---------------
@@ -73,6 +77,8 @@ CREATE TABLE public.projects (
 
 CREATE INDEX ix_projects_trace_retention_policy_id ON public.projects
     USING btree (trace_retention_policy_id);
+
+ALTER SEQUENCE public.projects_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: project_annotation_configs
@@ -101,6 +107,8 @@ CREATE INDEX ix_project_annotation_configs_annotation_config_id ON public.projec
 CREATE INDEX ix_project_annotation_configs_project_id ON public.project_annotation_configs
     USING btree (project_id);
 
+ALTER SEQUENCE public.project_annotation_configs_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: project_sessions
 -- -----------------------
@@ -124,6 +132,8 @@ CREATE INDEX ix_project_sessions_end_time ON public.project_sessions
 CREATE INDEX ix_project_sessions_project_id_start_time ON public.project_sessions
     USING btree (project_id, start_time DESC);
 
+ALTER SEQUENCE public.project_sessions_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: prompt_labels
 -- --------------------
@@ -137,6 +147,8 @@ CREATE TABLE public.prompt_labels (
 
 CREATE UNIQUE INDEX ix_prompt_labels_name ON public.prompt_labels
     USING btree (name);
+
+ALTER SEQUENCE public.prompt_labels_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: prompts
@@ -160,6 +172,8 @@ CREATE UNIQUE INDEX ix_prompts_name ON public.prompts
     USING btree (name);
 CREATE INDEX ix_prompts_source_prompt_id ON public.prompts
     USING btree (source_prompt_id);
+
+ALTER SEQUENCE public.prompts_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: prompts_prompt_labels
@@ -186,6 +200,8 @@ CREATE INDEX ix_prompts_prompt_labels_prompt_id ON public.prompts_prompt_labels
     USING btree (prompt_id);
 CREATE INDEX ix_prompts_prompt_labels_prompt_label_id ON public.prompts_prompt_labels
     USING btree (prompt_label_id);
+
+ALTER SEQUENCE public.prompts_prompt_labels_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: token_prices
@@ -238,6 +254,8 @@ CREATE INDEX ix_traces_project_rowid_start_time ON public.traces
 CREATE INDEX ix_traces_project_session_rowid ON public.traces
     USING btree (project_session_rowid);
 
+ALTER SEQUENCE public.traces_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: spans
 -- ------------
@@ -279,6 +297,8 @@ CREATE INDEX ix_spans_start_time ON public.spans
     USING btree (start_time);
 CREATE INDEX ix_spans_trace_rowid ON public.spans
     USING btree (trace_rowid);
+
+ALTER SEQUENCE public.spans_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: span_costs
@@ -354,6 +374,8 @@ CREATE TABLE public.user_roles (
 CREATE UNIQUE INDEX ix_user_roles_name ON public.user_roles
     USING btree (name);
 
+ALTER SEQUENCE public.user_roles_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: users
 -- ------------
@@ -400,6 +422,8 @@ CREATE INDEX ix_users_user_role_id ON public.users
 CREATE UNIQUE INDEX ix_users_username ON public.users
     USING btree (username);
 
+ALTER SEQUENCE public.users_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: api_keys
 -- ---------------
@@ -421,6 +445,8 @@ CREATE INDEX ix_api_keys_expires_at ON public.api_keys
     USING btree (expires_at);
 CREATE INDEX ix_api_keys_user_id ON public.api_keys
     USING btree (user_id);
+
+ALTER SEQUENCE public.api_keys_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: dataset_labels
@@ -487,6 +513,8 @@ CREATE TABLE public.datasets (
         ON DELETE SET NULL
 );
 
+ALTER SEQUENCE public.datasets_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: dataset_examples
 -- -----------------------
@@ -510,6 +538,8 @@ CREATE INDEX ix_dataset_examples_dataset_id ON public.dataset_examples
     USING btree (dataset_id);
 CREATE INDEX ix_dataset_examples_span_rowid ON public.dataset_examples
     USING btree (span_rowid);
+
+ALTER SEQUENCE public.dataset_examples_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: dataset_splits_dataset_examples
@@ -557,6 +587,8 @@ CREATE TABLE public.dataset_versions (
 CREATE INDEX ix_dataset_versions_dataset_id ON public.dataset_versions
     USING btree (dataset_id);
 
+ALTER SEQUENCE public.dataset_versions_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: dataset_example_revisions
 -- --------------------------------
@@ -591,6 +623,8 @@ CREATE TABLE public.dataset_example_revisions (
 
 CREATE INDEX ix_dataset_example_revisions_dataset_version_id ON public.dataset_example_revisions
     USING btree (dataset_version_id);
+
+ALTER SEQUENCE public.dataset_example_revisions_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: datasets_dataset_labels
@@ -655,6 +689,8 @@ CREATE TABLE public.document_annotations (
 
 CREATE INDEX ix_document_annotations_span_rowid ON public.document_annotations
     USING btree (span_rowid);
+
+ALTER SEQUENCE public.document_annotations_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: evaluators
@@ -805,6 +841,8 @@ CREATE INDEX ix_experiments_ephemeral_updated_at ON public.experiments
 CREATE INDEX ix_experiments_project_name ON public.experiments
     USING btree (project_name);
 
+ALTER SEQUENCE public.experiments_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: experiment_jobs
 -- ----------------------
@@ -924,6 +962,8 @@ CREATE TABLE public.experiment_runs (
 CREATE INDEX ix_experiment_runs_dataset_example_id ON public.experiment_runs
     USING btree (dataset_example_id);
 
+ALTER SEQUENCE public.experiment_runs_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: experiment_eval_logs
 -- ---------------------------
@@ -981,6 +1021,8 @@ CREATE TABLE public.experiment_run_annotations (
         REFERENCES public.experiment_runs (id)
         ON DELETE CASCADE
 );
+
+ALTER SEQUENCE public.experiment_run_annotations_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: experiment_tags
@@ -1131,6 +1173,8 @@ CREATE INDEX ix_password_reset_tokens_expires_at ON public.password_reset_tokens
 CREATE UNIQUE INDEX ix_password_reset_tokens_user_id ON public.password_reset_tokens
     USING btree (user_id);
 
+ALTER SEQUENCE public.password_reset_tokens_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: project_session_annotations
 -- ----------------------------------
@@ -1225,6 +1269,8 @@ CREATE INDEX ix_prompt_versions_prompt_id ON public.prompt_versions
 CREATE INDEX ix_prompt_versions_user_id ON public.prompt_versions
     USING btree (user_id);
 
+ALTER SEQUENCE public.prompt_versions_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: experiment_prompt_tasks
 -- ------------------------------
@@ -1298,6 +1344,8 @@ CREATE INDEX ix_prompt_version_tags_prompt_version_id ON public.prompt_version_t
 CREATE INDEX ix_prompt_version_tags_user_id ON public.prompt_version_tags
     USING btree (user_id);
 
+ALTER SEQUENCE public.prompt_version_tags_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: llm_evaluators
 -- ---------------------
@@ -1350,6 +1398,8 @@ CREATE INDEX ix_refresh_tokens_expires_at ON public.refresh_tokens
 CREATE INDEX ix_refresh_tokens_user_id ON public.refresh_tokens
     USING btree (user_id);
 
+ALTER SEQUENCE public.refresh_tokens_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: access_tokens
 -- --------------------
@@ -1377,6 +1427,8 @@ CREATE UNIQUE INDEX ix_access_tokens_refresh_token_id ON public.access_tokens
     USING btree (refresh_token_id);
 CREATE INDEX ix_access_tokens_user_id ON public.access_tokens
     USING btree (user_id);
+
+ALTER SEQUENCE public.access_tokens_id_seq MINVALUE -2147483648 CYCLE;
 
 
 -- Table: secrets
@@ -1435,6 +1487,8 @@ CREATE TABLE public.span_annotations (
 CREATE INDEX ix_span_annotations_span_rowid ON public.span_annotations
     USING btree (span_rowid);
 
+ALTER SEQUENCE public.span_annotations_id_seq MINVALUE -2147483648 CYCLE;
+
 
 -- Table: trace_annotations
 -- ------------------------
@@ -1476,3 +1530,5 @@ CREATE TABLE public.trace_annotations (
 
 CREATE INDEX ix_trace_annotations_trace_rowid ON public.trace_annotations
     USING btree (trace_rowid);
+
+ALTER SEQUENCE public.trace_annotations_id_seq MINVALUE -2147483648 CYCLE;
