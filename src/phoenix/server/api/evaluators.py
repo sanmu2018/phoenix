@@ -2890,16 +2890,28 @@ class CodeEvaluatorRunner(BaseEvaluator):
                         for _ in (output_configs or [None])  # type: ignore[list-item]
                     ]
                 except asyncio.TimeoutError as exc:
-                    # The manager's release-on-cancellation (acquire's finally)
-                    # decrements the in-flight count but does NOT fire
-                    # stop_session — teardown stays the runner's responsibility
-                    # via the existing fire-and-forget path. ``self._name``
-                    # remains the argument here to preserve the original
-                    # behavior for the user-typed-name path; the manager keys
-                    # by ``session_key`` separately.
-                    asyncio.create_task(
-                        _stop_session_quietly(self._sandbox_backend, self._name, logger)
-                    )
+                    # Teardown must (a) stop the backend sandbox under the
+                    # SAME key the session was started with (``session_key``,
+                    # which differs from ``self._name`` when
+                    # ``_session_key_override`` is set), and (b) when a
+                    # manager is in play, also evict the manager's tracked
+                    # entry. The acquire context-manager's finally only
+                    # decrements ``in_flight_count`` — it does NOT pop
+                    # ``_tracked`` unless ``marked_for_eviction`` is set, so
+                    # a direct ``backend.stop_session`` would leave a stale
+                    # entry whose next ``acquire()`` skips ``start_session``
+                    # and hands back a dead sandbox. ``evict_for_backend_key``
+                    # stops the backend AND removes the tracked entry atomically.
+                    if self._sandbox_session_manager is not None:
+                        asyncio.create_task(
+                            self._sandbox_session_manager.evict_for_backend_key(
+                                self._sandbox_backend, session_key
+                            )
+                        )
+                    else:
+                        asyncio.create_task(
+                            _stop_session_quietly(self._sandbox_backend, session_key, logger)
+                        )
                     execution = ExecutionResult(stdout="", stderr="", error="timeout")
                     sandbox_span.set_attributes(
                         _mask_attrs(

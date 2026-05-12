@@ -18,6 +18,7 @@ from phoenix.server.api.evaluators import (
     _PHOENIX_RESULT_END,
     CodeEvaluatorRunner,
 )
+from phoenix.server.sandbox.session_manager import SandboxSessionManager
 from phoenix.server.sandbox.types import ExecutionResult, SandboxBackend
 
 
@@ -195,3 +196,91 @@ class TestTimeoutWrapper:
         assert len(results) == 1
         assert results[0]["error"] == "runtime error"
         assert len(backend.stop_session_calls) == 0
+
+
+class TestTimeoutTeardownKeying:
+    """Regression tests for the timeout teardown path.
+
+    These guard two bugs:
+
+    1. Wrong session key (resource leak). When ``session_key`` is overridden
+       (the frontend-generated UUID path), the fire-and-forget teardown must
+       use the override key — not ``self._name``. Otherwise the backend's
+       ``stop_session`` looks up a non-existent key and leaks the sandbox.
+
+    2. Manager state desync (dead-session reuse). With a manager plumbed in,
+       teardown must route through ``evict_for_backend_key`` so the manager's
+       ``_tracked`` entry is removed atomically with stopping the backend.
+       A direct ``backend.stop_session`` would kill the sandbox while leaving
+       a stale ``_TrackedSession`` whose next ``acquire()`` skips
+       ``start_session`` and yields a handle to a dead sandbox.
+    """
+
+    @pytest.mark.asyncio
+    async def test_override_session_key_used_for_teardown(self) -> None:
+        backend = _SlowBackend()
+        override = "00000000-1111-2222-3333-444444444444"
+        runner = CodeEvaluatorRunner(
+            name="test-runner",
+            description=None,
+            source_code='def evaluate(**kw): return "pass"',
+            stored_output_configs=[_categorical_config()],
+            sandbox_backend=backend,
+            language="PYTHON",
+            timeout=1,
+            session_key=override,
+        )
+
+        await runner.evaluate(
+            context={},
+            input_mapping=_EMPTY_MAPPING,
+            name="test",
+            output_configs=[_categorical_config()],
+        )
+        # Let the fire-and-forget teardown task run
+        await asyncio.sleep(0)
+
+        # stop_session must be called with the override key — NOT self._name.
+        # The backend's session dict is keyed by the override, so calling
+        # stop_session("test-runner") would silently no-op and leak the sandbox.
+        assert backend.stop_session_calls == [override]
+
+    @pytest.mark.asyncio
+    async def test_manager_teardown_evicts_tracked_entry(self) -> None:
+        backend = _SlowBackend()
+        manager = SandboxSessionManager()
+        # Compress eviction-grace so the test doesn't sleep for the default 5s.
+        manager.eviction_grace_seconds = 0.05
+
+        runner = CodeEvaluatorRunner(
+            name="test-runner",
+            description=None,
+            source_code='def evaluate(**kw): return "pass"',
+            stored_output_configs=[_categorical_config()],
+            sandbox_backend=backend,
+            language="PYTHON",
+            timeout=1,
+            sandbox_session_manager=manager,
+        )
+
+        await runner.evaluate(
+            context={},
+            input_mapping=_EMPTY_MAPPING,
+            name="test",
+            output_configs=[_categorical_config()],
+        )
+
+        # Wait for the fire-and-forget eviction task to complete. Poll briefly
+        # because evict_for_backend_key awaits the eviction-grace window even
+        # when in_flight_count is already zero.
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if backend.stop_session_calls and not manager._tracked:
+                break
+
+        # Manager must have stopped the backend session AND removed its
+        # tracked entry. If either condition fails, the next acquire() for
+        # the same key would either skip start_session (state desync) or
+        # double-start (if stop succeeded but tracking lingered).
+        assert backend.stop_session_calls == ["test-runner"]
+        assert manager._tracked == {}
