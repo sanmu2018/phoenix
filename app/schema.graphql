@@ -2103,6 +2103,7 @@ input InlineCodeEvaluatorInput {
   outputConfigs: [AnnotationConfigInput!]!
   sandboxConfigId: ID = null
   description: String = null
+  sessionId: String = null
 }
 
 input InlineLLMEvaluatorInput {
@@ -2197,6 +2198,7 @@ type Mutation {
   deleteSystemApiKey(input: DeleteApiKeyInput!): DeleteApiKeyMutationPayload!
   deleteUserApiKey(input: DeleteApiKeyInput!): DeleteApiKeyMutationPayload!
   evaluatorPreviews(input: EvaluatorPreviewsInput!): EvaluatorPreviewsPayload!
+  stopEvaluatorSession(sessionId: String!): StopEvaluatorSessionPayload!
   createDatasetLabel(input: CreateDatasetLabelInput!): CreateDatasetLabelMutationPayload!
   deleteDatasetLabels(input: DeleteDatasetLabelsInput!): DeleteDatasetLabelsMutationPayload!
   setDatasetLabels(input: SetDatasetLabelsInput!): SetDatasetLabelsMutationPayload!
@@ -3753,6 +3755,11 @@ enum SpanStatusCode {
   OK
   ERROR
   UNSET
+}
+
+type StopEvaluatorSessionPayload {
+  sessionId: String!
+  stopped: Boolean!
 }
 
 type StopExperimentPayload {

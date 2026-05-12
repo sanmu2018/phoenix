@@ -120,7 +120,8 @@ class VercelSandboxBackend(SandboxBackend):
         self._packages: list[str] = list(packages) if packages else []
         self._internet_access = internet_access
         self._sessions: dict[str, AsyncSandbox] = {}
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # SandboxSessionManager serializes start_session per (backend, session_key),
+        # so per-key locks are not maintained on the backend itself.
         self.secret_values = compose_secret_values(
             user_env,
             self._token,
@@ -186,37 +187,38 @@ class VercelSandboxBackend(SandboxBackend):
             )
 
     async def start_session(self, session_key: str) -> None:
-        if session_key not in self._session_locks:
-            self._session_locks[session_key] = asyncio.Lock()
-        async with self._session_locks[session_key]:
-            if session_key in self._sessions:
-                logger.debug(f"Vercel session '{session_key}' already exists; reusing")
-                return
-            sandbox = await self._create_sandbox()
+        # SandboxSessionManager serializes start_session calls per (backend,
+        # session_key) — no internal lock needed here. The module-level
+        # _VERCEL_OIDC_ENV_LOCK still serializes env-mutation in
+        # _create_sandbox; that is independent of session creation dedup.
+        if session_key in self._sessions:
+            logger.debug(f"Vercel session '{session_key}' already exists; reusing")
+            return
+        sandbox = await self._create_sandbox()
+        try:
+            await self._install_packages(sandbox)
+        except Exception:
+            # Install failed — the sandbox is live but unusable. Stop and
+            # close it before re-raising so we don't leak a billable
+            # Vercel resource that lingers until the SDK's idle timeout.
             try:
-                await self._install_packages(sandbox)
+                await sandbox.stop()
             except Exception:
-                # Install failed — the sandbox is live but unusable. Stop and
-                # close it before re-raising so we don't leak a billable
-                # Vercel resource that lingers until the SDK's idle timeout.
-                try:
-                    await sandbox.stop()
-                except Exception:
-                    logger.debug(
-                        f"Error stopping Vercel sandbox after install failure for "
-                        f"session '{session_key}'",
-                        exc_info=True,
-                    )
-                try:
-                    await sandbox.client.aclose()
-                except Exception:
-                    logger.debug(
-                        f"Error closing Vercel client after install failure for "
-                        f"session '{session_key}'",
-                        exc_info=True,
-                    )
-                raise
-            self._sessions[session_key] = sandbox
+                logger.debug(
+                    f"Error stopping Vercel sandbox after install failure for "
+                    f"session '{session_key}'",
+                    exc_info=True,
+                )
+            try:
+                await sandbox.client.aclose()
+            except Exception:
+                logger.debug(
+                    f"Error closing Vercel client after install failure for "
+                    f"session '{session_key}'",
+                    exc_info=True,
+                )
+            raise
+        self._sessions[session_key] = sandbox
         logger.debug(f"Started Vercel session '{session_key}'")
 
     async def stop_session(self, session_key: str) -> None:

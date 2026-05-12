@@ -20,6 +20,8 @@ absent from ``_SANDBOX_ADAPTERS`` → status resolver maps to ``NOT_INSTALLED``
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -51,7 +53,43 @@ from phoenix.server.sandbox.types import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from phoenix.server.sandbox.session_manager import SandboxSessionManager
+
 logger = logging.getLogger(__name__)
+
+
+# Module-level handle to the app's SandboxSessionManager. Set during
+# lifespan startup via ``register_session_manager``; cleared during shutdown.
+# Invalidation paths (``invalidate_backend_cache``,
+# ``invalidate_backend_cache_for_key``, ``close_all_backends``) consult this
+# handle so that backend eviction also drains in-flight sandbox sessions
+# before ``backend.close()`` runs. ``None`` is a valid state — invalidation
+# falls back to the legacy close-only flow for tests / contexts where the
+# manager hasn't been wired (e.g. ``get_or_create_backend`` called from a
+# script). A module-level handle is used (rather than threading through
+# ``info.context``) because ``close_all_backends`` is registered as a
+# shutdown callback that has no GraphQL info / FastAPI request scope.
+_session_manager: Optional["SandboxSessionManager"] = None
+
+
+def register_session_manager(manager: "SandboxSessionManager") -> None:
+    """Register the app-scoped ``SandboxSessionManager`` for invalidation routing.
+
+    Called once during lifespan startup, immediately after the manager is
+    constructed. Subsequent calls overwrite the prior handle — tests that
+    construct a manager fixture must clear it via ``unregister_session_manager``
+    in teardown to avoid bleeding state across tests.
+    """
+    global _session_manager
+    _session_manager = manager
+
+
+def unregister_session_manager() -> None:
+    """Clear the module-level ``SandboxSessionManager`` handle.
+
+    Safe to call when no manager is registered."""
+    global _session_manager
+    _session_manager = None
 
 
 @dataclass
@@ -336,11 +374,127 @@ class _AllowlistGatedAdapterRegistry(MutableMapping[str, SandboxAdapter]):
 _SANDBOX_ADAPTERS: MutableMapping[str, SandboxAdapter] = _AllowlistGatedAdapterRegistry()
 
 
+# ---------------------------------------------------------------------------
+# Backend cache — (backend_type, config_hash) → SandboxBackend instance.
+#
+# Reintroduced atop upstream's no-cache factory so that session-capable
+# backends are reused across calls. The SandboxSessionManager keys
+# ``_TrackedSession`` by ``(id(backend), session_key)``; without backend
+# identity stability, "reuse" would always miss because every call would
+# get a fresh backend wrapper.
+#
+# Process-local — see notes in README/session_manager.py on multi-replica
+# semantics. For multi-replica deployments, evaluator/dataset traffic must
+# be routed by ``session_key`` consistency (sticky), or callers must accept
+# that warm sessions live within a single replica.
+# ---------------------------------------------------------------------------
+_BACKEND_CACHE: dict[tuple[str, str], SandboxBackend] = {}
+
+
+def _config_hash(config: Mapping[str, Any] | None) -> str:
+    """Return a stable hex digest for a config dict (or empty dict)."""
+    canonical = json.dumps(config or {}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def register_sandbox_adapter(adapter: SandboxAdapter) -> SandboxAdapter:
     """Register a SandboxAdapter in the runtime registry."""
     _SANDBOX_ADAPTERS[adapter.key] = adapter
     logger.debug(f"Registered sandbox adapter: {adapter.key!r}")
     return adapter
+
+
+async def close_all_backends() -> None:
+    """Close all cached SandboxBackend instances and clear the cache.
+
+    If a ``SandboxSessionManager`` is registered, evicts every cached
+    backend's sessions first (waits up to ``eviction_grace_seconds`` for
+    in-flight to drain, then marks-for-eviction). This closes the
+    close-during-use ambiguity on app shutdown: a session running when
+    shutdown begins gets a bounded window to finish before the backend
+    wrapper is torn down.
+    """
+    cached_backends = list(_BACKEND_CACHE.values())
+    if _session_manager is not None:
+        for backend in cached_backends:
+            try:
+                await _session_manager.evict_for_backend(backend)
+            except Exception:
+                logger.warning(
+                    "Error evicting sessions during close_all_backends for "
+                    f"backend={type(backend).__name__!r}",
+                    exc_info=True,
+                )
+    for key, backend in list(_BACKEND_CACHE.items()):
+        try:
+            await backend.close()
+        except Exception:
+            logger.warning(f"Error closing sandbox backend {key!r}", exc_info=True)
+    _BACKEND_CACHE.clear()
+
+
+async def invalidate_backend_cache(backend_type: str) -> None:
+    """Remove all _BACKEND_CACHE entries for backend_type, closing each backend.
+
+    If a ``SandboxSessionManager`` is registered, evicts each backend's
+    sessions through the manager BEFORE calling ``backend.close()`` so that
+    in-flight executions see ``stop_session`` fire on release rather than
+    racing with backend teardown.
+    """
+    evicted = 0
+    matching_keys = [k for k in _BACKEND_CACHE if k[0] == backend_type]
+    if _session_manager is not None:
+        for cache_key in matching_keys:
+            backend = _BACKEND_CACHE.get(cache_key)
+            if backend is None:
+                continue
+            try:
+                await _session_manager.evict_for_backend(backend)
+            except Exception:
+                logger.warning(
+                    f"Error evicting sessions for backend {cache_key!r}",
+                    exc_info=True,
+                )
+    for cache_key in matching_keys:
+        backend = _BACKEND_CACHE.pop(cache_key, None)
+        if backend is None:
+            continue
+        try:
+            await backend.close()
+        except Exception:
+            logger.warning(f"Error closing sandbox backend {cache_key!r}", exc_info=True)
+        evicted += 1
+    logger.debug(f"Invalidated {evicted} cache entries for backend_type={backend_type!r}")
+
+
+async def invalidate_backend_cache_for_key(key: str) -> None:
+    """Evict cached backends for every adapter whose credential_specs include `key`.
+
+    Used when a secret value changes (Secret row upserted/deleted) to ensure
+    backends holding the pre-rotation plaintext are rebuilt on next access.
+    Walks `_SANDBOX_ADAPTERS` and calls `invalidate_backend_cache(backend_type)`
+    for each matching adapter. Key comparison is exact against the `key` field
+    of each `ProviderCredentialSpec`.
+
+    Broader than `invalidate_backend_cache` because one credential key may be
+    shared by multiple backend_types (e.g.
+    VERCEL_TOKEN across VERCEL_PYTHON and VERCEL_TYPESCRIPT).
+    A per-adapter eviction failure logs and continues —
+    a rotation must not stall because one backend failed to close.
+    """
+    matched = 0
+    for backend_type, adapter in list(_SANDBOX_ADAPTERS.items()):
+        if any(spec.key == key for spec in adapter.credential_specs):
+            matched += 1
+            try:
+                await invalidate_backend_cache(backend_type)
+            except Exception:
+                logger.warning(
+                    f"Error invalidating cache for backend_type={backend_type!r} "
+                    f"after rotation of {key!r}",
+                    exc_info=True,
+                )
+    logger.debug(f"Invalidated cache across {matched} adapter(s) for key={key!r}")
 
 
 class MissingSecretError(Exception):
@@ -608,6 +762,53 @@ async def build_sandbox_backend(
             exc_info=True,
         )
         return None
+
+
+async def get_or_create_backend(
+    backend_type: str,
+    config: Mapping[str, Any] | None = None,
+    session: Optional[AsyncSession] = None,
+    decrypt: Optional[Callable[[bytes], bytes]] = None,
+) -> Optional[SandboxBackend]:
+    """Return a cached SandboxBackend for backend_type, creating it if needed.
+
+    Cached entry point for callers that need backend reuse — every callsite
+    that goes through ``SandboxSessionManager.acquire`` must call this, not
+    ``build_sandbox_backend``, because the session manager keys
+    ``_TrackedSession`` by ``(id(backend), session_key)``. A fresh backend
+    instance per call would make session reuse impossible.
+
+    Cache key is ``(backend_type, _config_hash(config))`` after credentials
+    are stripped out — credentials are resolved fresh per call inside
+    ``build_sandbox_backend``, but the resulting backend instance is keyed
+    only on user-supplied config so different requests with the same
+    SandboxConfig.config share one backend. Credential rotation MUST go
+    through ``invalidate_backend_cache_for_key`` to evict pre-rotation
+    backends.
+
+    Note: this cache is **process-local**. In multi-replica deployments,
+    each replica maintains its own backend cache and session manager state;
+    sessions only persist within a single replica. See module docs for
+    routing options (sticky by session_key, or accept per-replica reuse).
+
+    See ``build_sandbox_backend`` for the full credential-resolution and
+    error-handling contract — this wrapper preserves it verbatim and only
+    adds caching on top.
+    """
+    cache_key = (backend_type, _config_hash(config))
+    cached = _BACKEND_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    backend = await build_sandbox_backend(
+        backend_type, config=config, session=session, decrypt=decrypt
+    )
+    if backend is not None:
+        # Tolerate a concurrent insert: last-writer-wins is fine — both
+        # backends are equivalent and the loser will be GC'd. We avoid
+        # closing it here because close() is async and a sync replace
+        # would orphan its resources; a follow-up invalidation will reap.
+        _BACKEND_CACHE[cache_key] = backend
+    return backend
 
 
 # ---------------------------------------------------------------------------

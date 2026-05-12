@@ -1,5 +1,5 @@
 /**
- * @generated SignedSource<<e3b16994a3df86e2063a6bcdf54e47c3>>
+ * @generated SignedSource<<956d881203ec58431680e4bc7c03dedb>>
  * @lightSyntaxTransform
  * @nogrep
  */
@@ -207,6 +207,7 @@ export type InlineCodeEvaluatorInput = {
   name: string;
   outputConfigs: ReadonlyArray<AnnotationConfigInput>;
   sandboxConfigId?: string | null;
+  sessionId?: string | null;
   sourceCode: string;
 };
 export type EvaluatorInputMappingInput = {

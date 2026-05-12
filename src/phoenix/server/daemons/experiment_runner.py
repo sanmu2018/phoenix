@@ -88,6 +88,7 @@ from typing import (
     Callable,
     Hashable,
     Literal,
+    Optional,
     Protocol,
     Sequence,
     overload,
@@ -157,6 +158,7 @@ if TYPE_CHECKING:
     from phoenix.server.api.helpers.message_helpers import PlaygroundMessage
     from phoenix.server.api.helpers.playground_clients import ChatCompletionChunk
     from phoenix.server.api.input_types.GenerativeCredentialInput import GenerativeCredentialInput
+    from phoenix.server.sandbox.session_manager import SandboxSessionManager
     from phoenix.tracers import Tracer
 
 
@@ -2158,11 +2160,18 @@ class ExperimentRunner(DaemonTask):
         *,
         decrypt: Callable[[bytes], bytes],
         tracer_factory: Callable[[], Tracer],
+        sandbox_session_manager: Optional["SandboxSessionManager"] = None,
     ) -> None:
         super().__init__()
         self._db = db
         self._decrypt = decrypt
         self._tracer_factory = tracer_factory
+        # Optional manager — when present, ``get_evaluators`` forwards it to
+        # every ``CodeEvaluatorRunner`` it constructs so dataset-eval sessions
+        # participate in invalidation/eviction coordination. None at app boot
+        # (legacy tests, alternate entry points) falls back to direct backend
+        # execution; sessions on those runs are untracked.
+        self._sandbox_session_manager = sandbox_session_manager
         self._experiments: dict[ExperimentId, RunningExperiment] = {}
         self._seats = Semaphore(self.MAX_CONCURRENT)
         self._work_available = anyio.Event()
@@ -2543,6 +2552,7 @@ class ExperimentRunner(DaemonTask):
                 session=session,
                 decrypt=self._decrypt,
                 credentials=credentials,
+                sandbox_session_manager=self._sandbox_session_manager,
             )
             evaluator_run_specs = [
                 EvaluatorRunSpec(

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { graphql, useMutation } from "react-relay";
 
 import {
@@ -20,12 +20,14 @@ import { AnnotationDetailsContent } from "@phoenix/components/annotation/Annotat
 import { getPositiveOptimization } from "@phoenix/components/annotation/optimizationUtils";
 import { JSONBlock } from "@phoenix/components/code";
 import type { CodeEvaluatorTestSectionMutation } from "@phoenix/components/evaluators/__generated__/CodeEvaluatorTestSectionMutation.graphql";
+import type { CodeEvaluatorTestSectionStopMutation } from "@phoenix/components/evaluators/__generated__/CodeEvaluatorTestSectionStopMutation.graphql";
 import { buildOutputConfigsInput } from "@phoenix/components/evaluators/utils";
 import { ExperimentAnnotationButton } from "@phoenix/components/experiment/ExperimentAnnotationButton";
 import { useEvaluatorStore } from "@phoenix/contexts/EvaluatorContext";
 import type { AnnotationConfig } from "@phoenix/store/evaluatorStore";
 import type { CodeEvaluatorLanguage } from "@phoenix/types";
 import { getErrorMessagesFromRelayMutationError } from "@phoenix/utils/errorUtils";
+import { generateUUID } from "@phoenix/utils/uuidUtils";
 
 type EvaluationPreviewResult =
   | { kind: "success"; annotation: Annotation }
@@ -121,6 +123,10 @@ export const CodeEvaluatorTestSection = ({
     EvaluationPreviewResult[]
   >([]);
 
+  // Stable per-mount UUID — survives evaluator renames mid-iteration so the
+  // sandbox session is reused across consecutive preview calls.
+  const sessionId = useMemo(() => generateUUID(), []);
+
   const outputConfigs = useEvaluatorStore((state) => state.outputConfigs);
   const evaluatorName = useEvaluatorStore(
     (state) => state.evaluator.name || state.evaluator.globalName || "evaluator"
@@ -153,6 +159,31 @@ export const CodeEvaluatorTestSection = ({
         }
       }
     `);
+
+  const [stopEvaluatorSession] =
+    useMutation<CodeEvaluatorTestSectionStopMutation>(graphql`
+      mutation CodeEvaluatorTestSectionStopMutation($sessionId: String!) {
+        stopEvaluatorSession(sessionId: $sessionId) {
+          sessionId
+          stopped
+        }
+      }
+    `);
+
+  // Best-effort cleanup on unmount. Server-side idle TTL is the load-bearing
+  // eviction path; this mutation just makes intentional unmount evict sub-
+  // second instead of waiting for the TTL. Errors are swallowed — there is
+  // nothing the user can do about a failed cleanup, and the TTL covers it.
+  useEffect(() => {
+    return () => {
+      stopEvaluatorSession({
+        variables: { sessionId },
+        onError: () => {
+          /* idle TTL is the load-bearing path */
+        },
+      });
+    };
+  }, [sessionId, stopEvaluatorSession]);
 
   const onTestEvaluator = () => {
     setError(null);
@@ -188,6 +219,7 @@ export const CodeEvaluatorTestSection = ({
                   sourceCode,
                   outputConfigs: gqlOutputConfigs,
                   sandboxConfigId,
+                  sessionId,
                 },
               },
               inputMapping,

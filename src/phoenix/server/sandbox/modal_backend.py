@@ -98,7 +98,8 @@ class ModalSandboxBackend(SandboxBackend):
         self._user_env: dict[str, str] = dict(user_env or {})
         self._block_network = block_network
         self._sessions: dict[str, Sandbox] = {}
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        # SandboxSessionManager serializes start_session per (backend, session_key),
+        # so per-key locks are not maintained on the backend itself.
         self._client: Optional[Client] = None
         self._app: Optional[App] = None
         self._client_lock = asyncio.Lock()
@@ -160,14 +161,13 @@ class ModalSandboxBackend(SandboxBackend):
         return await modal.Sandbox.create.aio(**kwargs)
 
     async def start_session(self, session_key: str) -> None:
-        if session_key not in self._session_locks:
-            self._session_locks[session_key] = asyncio.Lock()
-        async with self._session_locks[session_key]:
-            if session_key in self._sessions:
-                logger.debug(f"Modal session '{session_key}' already exists; reusing")
-                return
-            sandbox = await self._create_sandbox()
-            self._sessions[session_key] = sandbox
+        # SandboxSessionManager serializes start_session calls per (backend,
+        # session_key) — no internal lock needed here.
+        if session_key in self._sessions:
+            logger.debug(f"Modal session '{session_key}' already exists; reusing")
+            return
+        sandbox = await self._create_sandbox()
+        self._sessions[session_key] = sandbox
         logger.debug(f"Started Modal session '{session_key}'")
 
     async def stop_session(self, session_key: str) -> None:
