@@ -199,6 +199,125 @@ async def test_acquire_raises_session_limit_exceeded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_acquires_respect_capacity_under_race() -> None:
+    """Regression: concurrent acquires for *different* keys on the same
+    backend can't both pass the capacity check.
+
+    Per-key locks alone don't serialize capacity accounting — two different
+    keys hold different per-key locks and can both yield on
+    ``backend.start_session`` before either inserts into ``_tracked``. The
+    check + reservation must run under ``_state_lock`` so the second acquire
+    sees the first's reservation immediately.
+    """
+    a_in_start = asyncio.Event()
+    release_a = asyncio.Event()
+
+    class _GatedBackend(SandboxBackend):
+        def __init__(self) -> None:
+            self.start_calls: list[str] = []
+
+        async def start_session(self, session_key: str) -> None:
+            self.start_calls.append(session_key)
+            if session_key == "a":
+                a_in_start.set()
+                await release_a.wait()
+
+        async def stop_session(self, session_key: str) -> None:
+            pass
+
+        async def execute(
+            self,
+            code: str,
+            session_key: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout="", stderr="")
+
+        async def close(self) -> None:
+            pass
+
+    backend = _GatedBackend()
+    manager = SandboxSessionManager(max_sessions_per_backend=1)
+
+    async def acquire_key(key: str) -> str:
+        try:
+            async with manager.acquire(backend, key):
+                return "acquired"
+        except SessionLimitExceeded:
+            return "rejected"
+
+    # Task A enters acquire and parks inside backend.start_session("a")
+    # AFTER reserving the slot under _state_lock.
+    task_a = asyncio.create_task(acquire_key("a"))
+    await a_in_start.wait()
+
+    # Task B attempts to acquire a different key on the same backend. With
+    # the fix it must see A's reservation under _state_lock and be rejected
+    # before ever calling backend.start_session("b"). Without the fix, B
+    # would pass the capacity check (because A hasn't inserted yet under the
+    # old code's logic) and proceed to start_session, exceeding the limit.
+    task_b = asyncio.create_task(acquire_key("b"))
+    result_b = await task_b
+
+    release_a.set()
+    result_a = await task_a
+
+    assert result_a == "acquired"
+    assert result_b == "rejected"
+    # The fix is observable here: start_session must never be called for "b".
+    assert backend.start_calls == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_start_session_failure_releases_reservation() -> None:
+    """If ``backend.start_session`` raises, the reserved slot must be popped
+    so the next acquire on the same key starts cleanly and capacity
+    accounting stays correct.
+    """
+
+    class _FailingBackend(SandboxBackend):
+        def __init__(self) -> None:
+            self.start_calls: list[str] = []
+            self.fail_next = True
+
+        async def start_session(self, session_key: str) -> None:
+            self.start_calls.append(session_key)
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("simulated start failure")
+
+        async def stop_session(self, session_key: str) -> None:
+            pass
+
+        async def execute(
+            self,
+            code: str,
+            session_key: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout=code, stderr="")
+
+        async def close(self) -> None:
+            pass
+
+    backend = _FailingBackend()
+    manager = SandboxSessionManager(max_sessions_per_backend=1)
+
+    with pytest.raises(RuntimeError, match="simulated start failure"):
+        async with manager.acquire(backend, "k1"):
+            pytest.fail("acquire body should not run when start_session fails")
+
+    # Reservation must have been rolled back — _tracked is empty, so the
+    # capacity slot is free and a fresh acquire starts a new session.
+    assert manager._tracked == {}
+
+    async with manager.acquire(backend, "k1") as session:
+        result = await session.execute("print('ok')")
+    assert result.stdout == "print('ok')"
+    assert backend.start_calls == ["k1", "k1"]
+
+
+@pytest.mark.asyncio
 async def test_no_op_for_stateless_backend() -> None:
     """BaseNoSessionBackend → acquire bypasses lock/state tracking entirely;
     backend.execute is invoked, no entries are added to manager state."""

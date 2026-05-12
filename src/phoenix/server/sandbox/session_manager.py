@@ -194,10 +194,24 @@ class SandboxSessionManager(DaemonTask):
         async with key_lock:
             tracked = self._tracked.get(key)
             if tracked is None:
-                await self._enforce_capacity_or_raise(backend)
-                await backend.start_session(session_key)
-                tracked = _TrackedSession(backend=backend, session_key=session_key)
-                self._tracked[key] = tracked
+                # Reserve the slot under ``_state_lock`` BEFORE awaiting
+                # ``backend.start_session``. Per-key locks alone don't close
+                # the capacity-check race: two concurrent ``acquire`` calls
+                # for *different* keys on the same backend hold *different*
+                # per-key locks, so without state-lock serialization both
+                # can pass the count check, both yield on start_session,
+                # and both insert — exceeding ``max_sessions_per_backend``.
+                tracked = await self._reserve_slot_or_raise(backend, key, session_key)
+                try:
+                    await backend.start_session(session_key)
+                except BaseException:
+                    # start_session failed: drop the reservation so capacity
+                    # accounting stays correct. Use state_lock to match the
+                    # write discipline elsewhere in the manager.
+                    assert self._state_lock is not None
+                    async with self._state_lock:
+                        self._tracked.pop(key, None)
+                    raise
             tracked.in_flight_count += 1
             tracked.last_used = monotonic()
 
@@ -268,14 +282,33 @@ class SandboxSessionManager(DaemonTask):
                 self._key_locks[key] = lock
             return lock
 
-    async def _enforce_capacity_or_raise(self, backend: SandboxBackend) -> None:
-        # Capacity is per-backend. Count tracked entries for this backend
-        # (matched by identity) — must run BEFORE backend.start_session so
-        # rejection leaves manager state unchanged.
-        backend_id = id(backend)
-        count = sum(1 for (bid, _) in self._tracked if bid == backend_id)
-        if count >= self._max_sessions_per_backend:
-            raise SessionLimitExceeded()
+    async def _reserve_slot_or_raise(
+        self,
+        backend: SandboxBackend,
+        key: tuple[int, str],
+        session_key: str,
+    ) -> _TrackedSession:
+        """Atomically check per-backend capacity and reserve a tracking slot.
+
+        Holds ``_state_lock`` for the read-modify-write so concurrent
+        acquires for *different* per-key locks can't both pass the count
+        check before either inserts. Returns the inserted
+        ``_TrackedSession`` (``in_flight_count == 0``); the caller starts
+        the backend session outside this lock and transitions the slot to
+        in-flight.
+
+        The caller is responsible for popping the entry if
+        ``backend.start_session`` fails — see ``acquire``'s rollback.
+        """
+        assert self._state_lock is not None
+        async with self._state_lock:
+            backend_id = id(backend)
+            count = sum(1 for (bid, _) in self._tracked if bid == backend_id)
+            if count >= self._max_sessions_per_backend:
+                raise SessionLimitExceeded()
+            tracked = _TrackedSession(backend=backend, session_key=session_key)
+            self._tracked[key] = tracked
+            return tracked
 
     async def _release(self, key: tuple[int, str]) -> None:
         # Snapshot decisions under the per-key lock, run stop_session
