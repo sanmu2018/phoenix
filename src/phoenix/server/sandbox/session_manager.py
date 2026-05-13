@@ -388,9 +388,7 @@ class SandboxSessionManager(DaemonTask):
             return
         if self._pending_tasks is None:
             self._pending_tasks = set()
-        task: Task[None] = asyncio.create_task(
-            self.evict_for_backend_key(backend, session_key)
-        )
+        task: Task[None] = asyncio.create_task(self.evict_for_backend_key(backend, session_key))
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
@@ -617,9 +615,7 @@ class SandboxSessionManager(DaemonTask):
                 # A fresh acquire on the same key inserts a new instance
                 # (the old one is popped by its last release) — that fresh
                 # entry is not what we marked, so drop it from the wait set.
-                marked = [
-                    (k, t) for (k, t) in marked if self._tracked.get(k) is t
-                ]
+                marked = [(k, t) for (k, t) in marked if self._tracked.get(k) is t]
 
     async def _sweep_idle(self) -> None:
         await self._ensure_state_lock()

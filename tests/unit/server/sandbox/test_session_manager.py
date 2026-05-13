@@ -397,9 +397,7 @@ async def test_release_after_lock_pop_still_decrements_inflight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_start() -> (
-    None
-):
+async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_start() -> None:
     """D2 regression: two acquires for the same key racing across a popped
     ``_key_locks`` entry must result in exactly one ``start_session`` call
     AND the follower's body must not enter until the leader's start_session

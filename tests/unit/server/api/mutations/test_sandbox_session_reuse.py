@@ -22,6 +22,7 @@ construction is faked.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Optional
 from unittest.mock import patch
 
@@ -112,8 +113,8 @@ class _FakeAdapter(SandboxAdapter):
 
     def build_backend(
         self,
-        config: dict[str, Any],
-        user_env: dict[str, str] | None = None,
+        config: Mapping[str, Any],
+        user_env: Optional[Mapping[str, str]] = None,
     ) -> SandboxBackend:
         return self._backend
 
