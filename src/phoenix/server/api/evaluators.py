@@ -2908,6 +2908,23 @@ class CodeEvaluatorRunner(BaseEvaluator):
                         self._sandbox_session_manager.schedule_eviction(
                             self._sandbox_backend, session_key
                         )
+                    else:
+                        # Back-compat path for direct-backend callers (no
+                        # manager plumbed). Fire-and-forget ``stop_session``
+                        # so the backend sandbox is released; otherwise it
+                        # leaks until idle TTL. Best-effort: swallow stop
+                        # failures and log a warning so the timeout result
+                        # still flows back to the caller.
+                        async def _stop_session_quietly() -> None:
+                            try:
+                                await self._sandbox_backend.stop_session(session_key)
+                            except Exception as stop_exc:
+                                logger.warning(
+                                    "stop_session failed during timeout teardown: %s",
+                                    stop_exc,
+                                )
+
+                        asyncio.create_task(_stop_session_quietly())
                     execution = ExecutionResult(stdout="", stderr="", error="timeout")
                     sandbox_span.set_attributes(
                         _mask_attrs(
