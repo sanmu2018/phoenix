@@ -310,11 +310,192 @@ async def test_start_session_failure_releases_reservation() -> None:
     # Reservation must have been rolled back — _tracked is empty, so the
     # capacity slot is free and a fresh acquire starts a new session.
     assert manager._tracked == {}
+    # D3's rollback-path lock pop: _key_locks entry must also be cleared
+    # so a failure storm doesn't slow-leak lock entries.
+    assert manager._key_locks == {}
 
     async with manager.acquire(backend, "k1") as session:
         result = await session.execute("print('ok')")
     assert result.stdout == "print('ok')"
     assert backend.start_calls == ["k1", "k1"]
+
+
+@pytest.mark.asyncio
+async def test_key_locks_no_unbounded_growth_across_acquire_evict_cycles() -> None:
+    """D3 regression: ``_key_locks`` entries must be popped alongside
+    ``_tracked`` entries on every eviction site. Without the pop, the dict
+    grows unboundedly across the process lifetime because the frontend mints
+    a fresh UUID per component mount.
+
+    Drives 100 acquire/evict/acquire cycles on distinct keys and asserts
+    ``len(_key_locks) <= 1`` — zero or one residual entry from the last
+    iteration, never N.
+    """
+    manager = SandboxSessionManager(max_sessions_per_backend=4)
+    backend = _FakeBackend()
+
+    for i in range(100):
+        key = f"k{i}"
+        async with manager.acquire(backend, key):
+            pass
+        await manager.evict_for_backend_key(backend, key)
+
+    assert len(manager._key_locks) <= 1, (
+        f"_key_locks should not grow unboundedly; got {len(manager._key_locks)} entries"
+    )
+    assert len(manager._tracked) <= 1, (
+        f"_tracked should not grow unboundedly; got {len(manager._tracked)} entries"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_after_lock_pop_still_decrements_inflight() -> None:
+    """D1 regression: a coroutine that captured the per-key lock reference
+    before a concurrent eviction popped ``_key_locks[key]`` must still
+    decrement ``in_flight_count`` correctly on release.
+
+    Drives the race: coroutine X acquires k1, exits cleanly. Then evict
+    pops both ``_tracked`` and ``_key_locks`` for k1. Coroutine Y was
+    waiting on the same per-key lock object across the pop. With the old
+    ``_release(key)`` signature, Y's release would do
+    ``self._key_locks.get(key)`` → None → return early, leaking the
+    in-flight count. With the D1 fix (``_release(key, key_lock)`` threaded
+    through), Y's release uses its captured lock reference and decrements
+    correctly.
+    """
+    manager = SandboxSessionManager(max_sessions_per_backend=2)
+    backend = _FakeBackend()
+
+    # X acquires and exits cleanly. _tracked stays (no marked_for_eviction).
+    async with manager.acquire(backend, "k1"):
+        pass
+
+    # Capture X's per-key lock reference BEFORE eviction pops it.
+    key = (id(backend), "k1")
+    captured_lock = manager._key_locks[key]
+
+    # Evict pops both _tracked[k1] and _key_locks[k1] (in_flight==0).
+    await manager.evict_for_backend_key(backend, "k1")
+    assert key not in manager._key_locks
+    assert key not in manager._tracked
+    assert backend.stop_calls == ["k1"]
+
+    # Now Y enters acquire fresh — gets a NEW _key_locks entry. After Y's
+    # release, _tracked and _key_locks should be consistent (in_flight
+    # decremented, residual entries optional).
+    async with manager.acquire(backend, "k1"):
+        # Inside Y's body the per-key lock entry is the fresh one, not
+        # captured_lock.
+        assert manager._key_locks[key] is not captured_lock
+        tracked = manager._tracked[key]
+        assert tracked.in_flight_count == 1
+    # After Y's release, in_flight_count must be back to 0 — the release
+    # was through the new lock and the new tracked entry. _tracked still
+    # holds the entry (no eviction marker) with in_flight_count == 0.
+    assert manager._tracked[key].in_flight_count == 0
+
+
+@pytest.mark.asyncio
+async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_start() -> (
+    None
+):
+    """D2 regression: two acquires for the same key racing across a popped
+    ``_key_locks`` entry must result in exactly one ``start_session`` call
+    AND the follower's body must not enter until the leader's start_session
+    has returned.
+
+    Sequence driven:
+    1. Leader X acquires k1, exits — release pops both dicts (marked for
+       eviction via evict_for_backend_key).
+    2. Y begins a new acquire for k1; gates inside ``backend.start_session``
+       on an Event so we can observe ordering.
+    3. Z begins a parallel acquire for k1 while Y is still parked in
+       start_session. Y is leader (is_new=True); Z is follower
+       (is_new=False) because Y inserted under _state_lock.
+    4. Assert Z does not enter its body before Y's start_session completes.
+    5. Release the gate; both complete.
+    6. Assert ``backend.start_calls.count("k1") == 1`` for the second-round
+       race (Y's start; Z reuses).
+    """
+
+    start_gate = asyncio.Event()
+    leader_in_start = asyncio.Event()
+    follower_entered_body = asyncio.Event()
+
+    class _GatedBackend(SandboxBackend):
+        def __init__(self) -> None:
+            self.start_calls: list[str] = []
+            self.stop_calls: list[str] = []
+
+        async def start_session(self, session_key: str) -> None:
+            self.start_calls.append(session_key)
+            if session_key == "k1" and len(self.start_calls) >= 2:
+                # Second start_session call (Y's) — park here.
+                leader_in_start.set()
+                await start_gate.wait()
+
+        async def stop_session(self, session_key: str) -> None:
+            self.stop_calls.append(session_key)
+
+        async def execute(
+            self,
+            code: str,
+            session_key: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout=code, stderr="")
+
+        async def close(self) -> None:
+            pass
+
+    backend = _GatedBackend()
+    manager = SandboxSessionManager(max_sessions_per_backend=4)
+
+    # Step 1: X acquires and is then evicted; both dicts pop.
+    async with manager.acquire(backend, "k1"):
+        pass
+    await manager.evict_for_backend_key(backend, "k1")
+    key = (id(backend), "k1")
+    assert key not in manager._key_locks
+    assert key not in manager._tracked
+
+    # Step 2: Y begins acquire — leader. Will park in start_session.
+    async def y_acquire() -> str:
+        async with manager.acquire(backend, "k1"):
+            return "y-acquired"
+
+    task_y = asyncio.create_task(y_acquire())
+    await leader_in_start.wait()
+
+    # Step 3: Z begins acquire — follower. Should block on start_ready.
+    async def z_acquire() -> str:
+        async with manager.acquire(backend, "k1"):
+            follower_entered_body.set()
+            return "z-acquired"
+
+    task_z = asyncio.create_task(z_acquire())
+
+    # Yield repeatedly to give Z a chance to advance — but assert it does
+    # NOT enter its body while Y is parked.
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert not follower_entered_body.is_set(), (
+        "follower must NOT enter body before leader's start_session resolves"
+    )
+
+    # Step 5: release gate; both should complete.
+    start_gate.set()
+    result_y = await task_y
+    result_z = await task_z
+    assert result_y == "y-acquired"
+    assert result_z == "z-acquired"
+
+    # Step 6: Y's start_session was called exactly once for k1 in the
+    # second race round. Total starts: X's k1 + Y's k1 == 2.
+    assert backend.start_calls.count("k1") == 2, (
+        f"start_session must be called once for X and once for Y, never for Z; "
+        f"got start_calls={backend.start_calls}"
+    )
 
 
 @pytest.mark.asyncio

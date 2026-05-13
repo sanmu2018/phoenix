@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
-from asyncio import Lock, sleep
+from asyncio import Event, Lock, sleep
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from time import monotonic
@@ -77,6 +77,14 @@ class _TrackedSession:
     in_flight_count: int = 0
     last_used: float = field(default_factory=monotonic)
     marked_for_eviction: bool = False
+    # Startup-readiness gate: the leader (is_new=True acquire) flips
+    # ``start_ready`` after ``backend.start_session`` resolves so concurrent
+    # followers waiting on the same key block from crossing the in_flight
+    # boundary until the backend session actually exists. On failure the
+    # leader records the exception in ``start_error`` and signals readiness
+    # so followers wake and re-raise the same error.
+    start_ready: Event = field(default_factory=Event)
+    start_error: Optional[BaseException] = None
 
 
 class SandboxSession:
@@ -192,33 +200,51 @@ class SandboxSessionManager(DaemonTask):
         key_lock = await self._get_or_create_key_lock(key)
 
         async with key_lock:
-            tracked = self._tracked.get(key)
-            if tracked is None:
-                # Reserve the slot under ``_state_lock`` BEFORE awaiting
-                # ``backend.start_session``. Per-key locks alone don't close
-                # the capacity-check race: two concurrent ``acquire`` calls
-                # for *different* keys on the same backend hold *different*
-                # per-key locks, so without state-lock serialization both
-                # can pass the count check, both yield on start_session,
-                # and both insert — exceeding ``max_sessions_per_backend``.
-                tracked = await self._reserve_slot_or_raise(backend, key, session_key)
+            # Existence + capacity + insertion are atomic under
+            # ``_state_lock``: when ``_key_locks`` becomes poppable, two
+            # acquires for the same logical key may hold different per-key
+            # locks, so the per-key lock is no longer the authority for
+            # dedup. Folding the existence check into the capacity-check +
+            # insertion critical section makes ``_state_lock`` the inner
+            # authority and closes the duplicate-start gap.
+            tracked, is_new = await self._get_or_reserve(backend, key, session_key)
+            if is_new:
                 try:
                     await backend.start_session(session_key)
-                except BaseException:
+                except BaseException as exc:
                     # start_session failed: drop the reservation so capacity
-                    # accounting stays correct. Use state_lock to match the
-                    # write discipline elsewhere in the manager.
+                    # accounting stays correct, then wake any followers
+                    # waiting on the readiness gate so they observe the
+                    # error and re-raise. ``_key_locks`` is popped here too
+                    # so a failure storm doesn't slow-leak lock entries —
+                    # safe because no other coroutine can be parked on
+                    # ``key_lock`` while this acquire holds it.
+                    tracked.start_error = exc
                     assert self._state_lock is not None
                     async with self._state_lock:
                         self._tracked.pop(key, None)
+                        self._key_locks.pop(key, None)
+                    tracked.start_ready.set()
                     raise
+                tracked.start_ready.set()
+
+            # All acquires (leader and follower) wait for startup to settle
+            # before crossing the in_flight boundary. The leader sets
+            # ``start_ready`` immediately above; a follower may park here
+            # and wake only after the leader's start_session resolves. If
+            # startup failed, propagate the leader's exception so the
+            # follower doesn't yield a SandboxSession against a backend
+            # session that does not exist.
+            await tracked.start_ready.wait()
+            if tracked.start_error is not None:
+                raise tracked.start_error
             tracked.in_flight_count += 1
             tracked.last_used = monotonic()
 
         try:
             yield SandboxSession(backend, session_key)
         finally:
-            await self._release(key)
+            await self._release(key, key_lock)
 
     async def evict_for_backend(self, backend: SandboxBackend) -> None:
         """Evict all tracked sessions for ``backend``.
@@ -282,42 +308,54 @@ class SandboxSessionManager(DaemonTask):
                 self._key_locks[key] = lock
             return lock
 
-    async def _reserve_slot_or_raise(
+    async def _get_or_reserve(
         self,
         backend: SandboxBackend,
         key: tuple[int, str],
         session_key: str,
-    ) -> _TrackedSession:
-        """Atomically check per-backend capacity and reserve a tracking slot.
+    ) -> tuple[_TrackedSession, bool]:
+        """Atomically resolve an existing tracking slot or reserve a fresh one.
 
-        Holds ``_state_lock`` for the read-modify-write so concurrent
-        acquires for *different* per-key locks can't both pass the count
-        check before either inserts. Returns the inserted
-        ``_TrackedSession`` (``in_flight_count == 0``); the caller starts
-        the backend session outside this lock and transitions the slot to
-        in-flight.
+        Under ``_state_lock``: (1) if ``_tracked[key]`` exists, return
+        ``(existing, False)`` without rechecking capacity — followers piggy-
+        back on the leader's reservation. (2) Otherwise enforce
+        ``max_sessions_per_backend`` and insert a fresh ``_TrackedSession``
+        whose ``start_ready`` is unset; return ``(new, True)``. The leader
+        (``is_new=True``) is responsible for invoking ``backend.start_session``
+        outside this lock and flipping ``start_ready`` when it resolves.
 
-        The caller is responsible for popping the entry if
-        ``backend.start_session`` fails — see ``acquire``'s rollback.
+        Folding the existence check into the same critical section as the
+        capacity check + insertion is what makes popping ``_key_locks`` safe:
+        once the per-key lock is no longer the dedup authority, ``_state_lock``
+        must be — so the existence check, capacity check, and insertion all
+        run under it. The caller is responsible for popping the entry under
+        ``_state_lock`` if ``backend.start_session`` fails (see ``acquire``'s
+        rollback).
         """
         assert self._state_lock is not None
         async with self._state_lock:
+            existing = self._tracked.get(key)
+            if existing is not None:
+                return existing, False
             backend_id = id(backend)
             count = sum(1 for (bid, _) in self._tracked if bid == backend_id)
             if count >= self._max_sessions_per_backend:
                 raise SessionLimitExceeded()
             tracked = _TrackedSession(backend=backend, session_key=session_key)
             self._tracked[key] = tracked
-            return tracked
+            return tracked, True
 
-    async def _release(self, key: tuple[int, str]) -> None:
+    async def _release(self, key: tuple[int, str], key_lock: Lock) -> None:
+        # ``acquire`` passes the lock reference it captured at acquire-time,
+        # so ``_release`` never has to look ``_key_locks`` up. The lock
+        # object outlives its dict entry, which is what makes popping
+        # ``_key_locks`` alongside ``_tracked`` safe — a coroutine that
+        # captured the lock before a concurrent eviction popped the dict
+        # entry still releases through the same Lock instance.
         # Snapshot decisions under the per-key lock, run stop_session
         # outside the lock to avoid blocking other acquires on the same key.
         stop_backend: Optional[SandboxBackend] = None
         stop_key: Optional[str] = None
-        key_lock = self._key_locks.get(key)
-        if key_lock is None:
-            return
         async with key_lock:
             tracked = self._tracked.get(key)
             if tracked is None:
@@ -328,6 +366,7 @@ class SandboxSessionManager(DaemonTask):
                 stop_backend = tracked.backend
                 stop_key = tracked.session_key
                 self._tracked.pop(key, None)
+                self._key_locks.pop(key, None)
         if stop_backend is not None and stop_key is not None:
             try:
                 await stop_backend.stop_session(stop_key)
@@ -365,6 +404,7 @@ class SandboxSessionManager(DaemonTask):
                     stop_backend = tracked.backend
                     stop_key = tracked.session_key
                     self._tracked.pop(key, None)
+                    self._key_locks.pop(key, None)
                 else:
                     tracked.marked_for_eviction = True
                     marked.append(key)
@@ -421,6 +461,7 @@ class SandboxSessionManager(DaemonTask):
                 stop_backend = tracked.backend
                 stop_key = tracked.session_key
                 self._tracked.pop(key, None)
+                self._key_locks.pop(key, None)
             if stop_backend is not None and stop_key is not None:
                 try:
                     await stop_backend.stop_session(stop_key)
