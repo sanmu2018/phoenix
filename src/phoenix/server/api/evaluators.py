@@ -62,6 +62,7 @@ from phoenix.server.api.types.ChatCompletionSubscriptionPayload import ToolCallC
 from phoenix.server.sandbox import MissingSecretError  # noqa: E402
 from phoenix.server.sandbox.session_manager import (
     SandboxSessionManager,
+    SessionInvalidated,
     SessionLimitExceeded,
 )
 from phoenix.server.sandbox.types import ExecutionResult, SandboxBackend, UnsupportedOperation
@@ -2579,15 +2580,6 @@ def _infer_typescript_evaluate_input_schema(
     return (_make_object_input_schema(parameter_names, required_names), None)
 
 
-async def _stop_session_quietly(
-    backend: SandboxBackend, session_key: str, log: logging.Logger
-) -> None:
-    try:
-        await backend.stop_session(session_key)
-    except Exception as exc:
-        log.warning("stop_session failed during timeout teardown: %s", exc)
-
-
 class CodeEvaluatorRunner(BaseEvaluator):
     """
     Evaluator that executes user-provided source code in a sandbox.
@@ -2889,28 +2881,32 @@ class CodeEvaluatorRunner(BaseEvaluator):
                         self._make_error_result(name, err, start_time, trace_id=trace_id)
                         for _ in (output_configs or [None])  # type: ignore[list-item]
                     ]
+                except SessionInvalidated as exc:
+                    err = SessionInvalidated.MESSAGE
+                    _record_masked_exception(sandbox_span, exc, masker)
+                    _set_masked_status(sandbox_span, StatusCode.ERROR, err, masker)
+                    _record_masked_exception(evaluator_span, exc, masker)
+                    _set_masked_status(evaluator_span, StatusCode.ERROR, err, masker)
+                    return [
+                        self._make_error_result(name, err, start_time, trace_id=trace_id)
+                        for _ in (output_configs or [None])  # type: ignore[list-item]
+                    ]
                 except asyncio.TimeoutError as exc:
-                    # Teardown must (a) stop the backend sandbox under the
-                    # SAME key the session was started with (``session_key``,
+                    # Teardown must stop the backend sandbox under the SAME
+                    # key the session was started with (``session_key``,
                     # which differs from ``self._name`` when
-                    # ``_session_key_override`` is set), and (b) when a
-                    # manager is in play, also evict the manager's tracked
-                    # entry. The acquire context-manager's finally only
-                    # decrements ``in_flight_count`` — it does NOT pop
-                    # ``_tracked`` unless ``marked_for_eviction`` is set, so
-                    # a direct ``backend.stop_session`` would leave a stale
-                    # entry whose next ``acquire()`` skips ``start_session``
-                    # and hands back a dead sandbox. ``evict_for_backend_key``
-                    # stops the backend AND removes the tracked entry atomically.
+                    # ``_session_key_override`` is set) AND remove the
+                    # manager's tracked entry — the acquire context
+                    # manager's finally only decrements ``in_flight_count``
+                    # and does not pop ``_tracked`` unless the entry was
+                    # already marked for eviction. Routing through the
+                    # manager's ``schedule_eviction`` (rather than a
+                    # discarded ``asyncio.create_task``) hands the task to
+                    # the manager so it is awaited at shutdown instead of
+                    # being cancelled mid-flight.
                     if self._sandbox_session_manager is not None:
-                        asyncio.create_task(
-                            self._sandbox_session_manager.evict_for_backend_key(
-                                self._sandbox_backend, session_key
-                            )
-                        )
-                    else:
-                        asyncio.create_task(
-                            _stop_session_quietly(self._sandbox_backend, session_key, logger)
+                        self._sandbox_session_manager.schedule_eviction(
+                            self._sandbox_backend, session_key
                         )
                     execution = ExecutionResult(stdout="", stderr="", error="timeout")
                     sandbox_span.set_attributes(

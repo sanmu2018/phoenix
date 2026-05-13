@@ -18,9 +18,10 @@ constructing a new manager.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from asyncio import Event, Lock, sleep
+from asyncio import Event, Lock, Task, sleep
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from time import monotonic
@@ -53,6 +54,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid int for %s=%r; using default %s", name, raw, default)
+        return default
+
+
 class SessionLimitExceeded(Exception):
     """Raised by ``SandboxSessionManager.acquire`` when a backend has reached
     ``max_sessions_per_backend``.
@@ -65,6 +77,25 @@ class SessionLimitExceeded(Exception):
     """
 
     MESSAGE = "session_limit_exceeded"
+
+    def __init__(self, message: str = MESSAGE) -> None:
+        super().__init__(message)
+
+
+class SessionInvalidated(Exception):
+    """Raised by ``SandboxSessionManager.acquire`` when a tracked session has
+    been marked for eviction.
+
+    Admit-block refusal — the existing entry is draining and will be stopped
+    once in-flight users release. New admits must not extend its lifetime
+    past the explicit stop request. Raised BEFORE ``backend.start_session``
+    is called; the manager's internal state is unchanged when the exception
+    propagates. ``CodeEvaluatorRunner`` converts this to an
+    ``ExecutionResult`` with a stable error code so the UI sees a
+    deterministic, user-actionable message rather than a silent restart.
+    """
+
+    MESSAGE = "session_invalidated"
 
     def __init__(self, message: str = MESSAGE) -> None:
         super().__init__(message)
@@ -121,25 +152,59 @@ class SandboxSessionManager(DaemonTask):
     - ``acquire(backend, session_key)`` — async context manager. Starts (or
       reuses) a session and yields a ``SandboxSession``. Enforces
       ``max_sessions_per_backend`` before invoking ``backend.start_session``.
+      Refuses admits onto entries marked for eviction by raising
+      ``SessionInvalidated``.
     - ``evict_for_backend(backend)`` / ``evict_for_backend_type(type)`` /
       ``evict_for_backend_key(backend, key)`` — invalidation API. Stops
       backend sessions whose in-flight count is zero immediately; marks
       in-use sessions for stop-on-release.
+    - ``schedule_eviction(backend, session_key)`` — fire-and-forget API for
+      callers that cannot ``await`` the eviction inline (notably the
+      per-execute timeout teardown in ``CodeEvaluatorRunner``, which runs
+      in both GraphQL request and ``ExperimentRunner`` daemon scopes). The
+      created task is retained on the manager so shutdown awaits it.
     - Background sweeper (``_run``) evicts entries whose ``last_used``
       crosses the idle TTL with ``in_flight_count == 0``.
 
     Stateless backends (``BaseNoSessionBackend``) bypass all locking and
     state tracking — ``acquire`` returns a handle wired directly to
     ``backend.execute``.
+
+    **Lock-order invariant.** Two locks coexist: a single ``_state_lock``
+    that guards the ``_tracked`` / ``_key_locks`` dicts, and one
+    ``asyncio.Lock`` per ``(backend_id, session_key)`` in ``_key_locks``.
+    ``acquire`` takes the per-key lock OUTER and ``_state_lock`` INNER
+    (existence check, capacity check, and reservation insertion all run
+    under ``_state_lock`` so a fresh same-key acquire sees a leader's
+    reservation immediately). ``evict_for_backend*`` and ``_sweep_idle``
+    take ``_state_lock`` only long enough to snapshot the target keys,
+    then release it before acquiring each per-key lock — holding both
+    locks across an ``await`` on ``backend.stop_session`` would deadlock
+    against an in-flight acquire on the same key.
+
+    **Shutdown ordering.** ``stop()`` (overridden from ``DaemonTask``)
+    drains in three phases under the inherited 10s ceiling:
+    (1) await ``_pending_tasks`` (fire-and-forget evictions from
+    ``schedule_eviction``) under ``wait_for(eviction_grace_seconds)`` so
+    their underlying ``stop_session`` calls complete rather than being
+    cancelled mid-flight; (2) snapshot unique backends from ``_tracked``
+    and call ``evict_for_backend`` on each (marks in-flight entries and
+    waits up to ``eviction_grace_seconds`` for them to drain);
+    (3) ``super().stop()`` cancels the sweeper. ``_pending_tasks`` is a
+    set held adjacent to (not merged into) the inherited ``self._tasks``:
+    ``self._tasks`` holds tasks spawned from ``_run`` and is drained by
+    cancel-then-gather; ``_pending_tasks`` holds externally-scheduled
+    work the manager owns through completion, so it is awaited (not
+    cancelled) at shutdown.
     """
 
     def __init__(
         self,
         *,
         idle_ttl_seconds: Optional[float] = None,
-        sweep_interval_seconds: float = _DEFAULT_SWEEP_INTERVAL_SECONDS,
-        eviction_grace_seconds: float = _DEFAULT_EVICTION_GRACE_SECONDS,
-        max_sessions_per_backend: int = _DEFAULT_MAX_SESSIONS_PER_BACKEND,
+        sweep_interval_seconds: Optional[float] = None,
+        eviction_grace_seconds: Optional[float] = None,
+        max_sessions_per_backend: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._idle_ttl_seconds: float = (
@@ -150,15 +215,42 @@ class SandboxSessionManager(DaemonTask):
                 _DEFAULT_IDLE_TTL_SECONDS,
             )
         )
-        self._sweep_interval_seconds = sweep_interval_seconds
-        self._eviction_grace_seconds = eviction_grace_seconds
-        self._max_sessions_per_backend = max_sessions_per_backend
+        self._sweep_interval_seconds: float = (
+            sweep_interval_seconds
+            if sweep_interval_seconds is not None
+            else _env_float(
+                "PHOENIX_SANDBOX_SWEEP_INTERVAL_SECONDS",
+                _DEFAULT_SWEEP_INTERVAL_SECONDS,
+            )
+        )
+        self._eviction_grace_seconds: float = (
+            eviction_grace_seconds
+            if eviction_grace_seconds is not None
+            else _env_float(
+                "PHOENIX_SANDBOX_EVICTION_GRACE_SECONDS",
+                _DEFAULT_EVICTION_GRACE_SECONDS,
+            )
+        )
+        self._max_sessions_per_backend: int = (
+            max_sessions_per_backend
+            if max_sessions_per_backend is not None
+            else _env_int(
+                "PHOENIX_SANDBOX_MAX_SESSIONS_PER_BACKEND",
+                _DEFAULT_MAX_SESSIONS_PER_BACKEND,
+            )
+        )
 
         # asyncio primitives are loop-bound; construct lazily inside the
         # running loop (start() / acquire()) rather than at __init__ time.
         self._state_lock: Optional[Lock] = None
         self._key_locks: dict[tuple[int, str], Lock] = {}
         self._tracked: dict[tuple[int, str], _TrackedSession] = {}
+        # Fire-and-forget eviction tasks scheduled via schedule_eviction.
+        # Held adjacent to (not merged into) self._tasks: self._tasks is the
+        # daemon body spawned from _run() and is cancelled by DaemonTask.stop;
+        # _pending_tasks is awaited (not cancelled) on stop so the underlying
+        # backend.stop_session completes rather than being cancelled mid-flight.
+        self._pending_tasks: Optional[set[Task[None]]] = None
 
     @property
     def eviction_grace_seconds(self) -> float:
@@ -278,6 +370,30 @@ class SandboxSessionManager(DaemonTask):
 
         await self._evict_matching(_match)
 
+    def schedule_eviction(
+        self,
+        backend: SandboxBackend,
+        session_key: str,
+    ) -> None:
+        """Schedule a fire-and-forget eviction of (backend, session_key).
+
+        Used by callers that cannot await the eviction inline — notably the
+        per-execute timeout teardown in ``CodeEvaluatorRunner.evaluate``,
+        which runs in both a GraphQL request scope and the ``ExperimentRunner``
+        daemon scope. The created task is retained on the manager so it is
+        awaited (not cancelled) during shutdown, completing the underlying
+        ``backend.stop_session`` rather than leaking the orphan.
+        """
+        if isinstance(backend, BaseNoSessionBackend):
+            return
+        if self._pending_tasks is None:
+            self._pending_tasks = set()
+        task: Task[None] = asyncio.create_task(
+            self.evict_for_backend_key(backend, session_key)
+        )
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+
     # ------------------------------------------------------------------
     # DaemonTask body
     # ------------------------------------------------------------------
@@ -290,6 +406,59 @@ class SandboxSessionManager(DaemonTask):
             except Exception:
                 logger.exception("Sandbox session manager sweep failed")
             await sleep(self._sweep_interval_seconds)
+
+    async def stop(self) -> None:
+        """Drain in-flight sessions, then cancel the sweeper.
+
+        Ordering matters: ``_pending_tasks`` (fire-and-forget evictions
+        scheduled via ``schedule_eviction``) are awaited first so the
+        underlying ``backend.stop_session`` calls complete instead of being
+        cancelled mid-flight; then each unique backend tracked in
+        ``_tracked`` is drained via ``evict_for_backend`` (which marks
+        in-flight entries for eviction and waits up to
+        ``eviction_grace_seconds`` for them to release); finally
+        ``super().stop()`` cancels the sweeper task. The combined wall
+        clock budget must fit within ``DaemonTask.stop``'s 10s ceiling:
+        ``eviction_grace_seconds * N_unique_backends + drain(_pending_tasks)``.
+        """
+        # Drain pending evictions first — they may already be the call that
+        # would have popped a tracked entry. Use gather(return_exceptions=True)
+        # under wait_for so a single failing task neither cancels its
+        # siblings nor blocks shutdown.
+        pending = self._pending_tasks
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=self._eviction_grace_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Pending sandbox eviction tasks did not drain within %.2fs",
+                    self._eviction_grace_seconds,
+                )
+        # Snapshot unique backends under the state lock; iterate evictions
+        # outside the lock so each per-backend drain holds only its own
+        # per-key locks (avoiding cross-key lock contention during shutdown).
+        await self._ensure_state_lock()
+        assert self._state_lock is not None
+        async with self._state_lock:
+            seen_ids: set[int] = set()
+            unique_backends: list[SandboxBackend] = []
+            for tracked in self._tracked.values():
+                bid = id(tracked.backend)
+                if bid not in seen_ids:
+                    seen_ids.add(bid)
+                    unique_backends.append(tracked.backend)
+        for backend in unique_backends:
+            try:
+                await self.evict_for_backend(backend)
+            except Exception:
+                logger.exception(
+                    "Failed to evict sandbox backend during shutdown: backend=%r",
+                    type(backend).__name__,
+                )
+        await super().stop()
 
     # ------------------------------------------------------------------
     # Internals
@@ -336,6 +505,14 @@ class SandboxSessionManager(DaemonTask):
         async with self._state_lock:
             existing = self._tracked.get(key)
             if existing is not None:
+                # Refuse to admit new callers onto a session that another
+                # caller has explicitly invalidated. The entry is draining
+                # and will be stopped on its last release; piggy-backing a
+                # fresh acquire would extend its lifetime past the stop
+                # request. Surface a deterministic error rather than a
+                # silent restart so the UI can decide whether to retry.
+                if existing.marked_for_eviction:
+                    raise SessionInvalidated()
                 return existing, False
             backend_id = id(backend)
             count = sum(1 for (bid, _) in self._tracked if bid == backend_id)
@@ -388,8 +565,12 @@ class SandboxSessionManager(DaemonTask):
         async with self._state_lock:
             targets = [k for k, t in list(self._tracked.items()) if predicate(t)]
         # First pass: stop idle sessions immediately; mark in-flight sessions
-        # for eviction. Track the latter so we can wait for them to drain.
-        marked: list[tuple[int, str]] = []
+        # for eviction. Track the latter (with the tracked instance, not just
+        # the key) so the drain poll can identity-check against the same
+        # entry — a fresh same-key acquire that pops the marked entry and
+        # inserts a new one must not be misread as the marked entry having
+        # drained.
+        marked: list[tuple[tuple[int, str], _TrackedSession]] = []
         for key in targets:
             key_lock = self._key_locks.get(key)
             if key_lock is None:
@@ -407,7 +588,7 @@ class SandboxSessionManager(DaemonTask):
                     self._key_locks.pop(key, None)
                 else:
                     tracked.marked_for_eviction = True
-                    marked.append(key)
+                    marked.append((key, tracked))
             if stop_backend is not None and stop_key is not None:
                 try:
                     await stop_backend.stop_session(stop_key)
@@ -431,7 +612,14 @@ class SandboxSessionManager(DaemonTask):
         while marked and monotonic() < deadline:
             await sleep(poll_interval)
             async with self._state_lock:
-                marked = [k for k in marked if k in self._tracked]
+                # Identity check: the entry is still draining only if the
+                # same ``_TrackedSession`` instance is still under the key.
+                # A fresh acquire on the same key inserts a new instance
+                # (the old one is popped by its last release) — that fresh
+                # entry is not what we marked, so drop it from the wait set.
+                marked = [
+                    (k, t) for (k, t) in marked if self._tracked.get(k) is t
+                ]
 
     async def _sweep_idle(self) -> None:
         await self._ensure_state_lock()

@@ -22,6 +22,7 @@ import pytest
 
 from phoenix.server.sandbox.session_manager import (
     SandboxSessionManager,
+    SessionInvalidated,
     SessionLimitExceeded,
 )
 from phoenix.server.sandbox.types import (
@@ -539,3 +540,213 @@ async def test_daemontask_stop_cancels_sweeper_within_grace(
     # Sweeper task is fully done and cleared.
     assert manager._tasks == []
     # Stop must complete within the DaemonTask 10s grace; if we got here we passed.
+
+
+@pytest.mark.asyncio
+async def test_acquire_raises_session_invalidated_when_marked_for_eviction() -> None:
+    """An existing tracked entry marked for eviction must refuse new admits.
+
+    Drives the race: a long-running acquire holds an in-flight session;
+    a concurrent ``evict_for_backend_key`` marks the entry for eviction
+    (cannot stop synchronously because in_flight > 0); a fresh acquire
+    on the same key must observe ``marked_for_eviction`` and raise
+    ``SessionInvalidated`` rather than piggy-backing onto the drained-out
+    entry.
+    """
+    leader_in_body = asyncio.Event()
+    release_leader = asyncio.Event()
+
+    manager = SandboxSessionManager(
+        max_sessions_per_backend=4,
+        eviction_grace_seconds=0.0,
+    )
+    backend = _FakeBackend()
+
+    async def long_acquire() -> None:
+        async with manager.acquire(backend, "k1"):
+            leader_in_body.set()
+            await release_leader.wait()
+
+    leader = asyncio.create_task(long_acquire())
+    await leader_in_body.wait()
+
+    # Mark the entry for eviction — in-flight > 0, so the entry stays
+    # tracked with marked_for_eviction=True and the eviction-grace poll
+    # returns immediately (grace=0.0).
+    await manager.evict_for_backend_key(backend, "k1")
+
+    # Fresh acquire on the same key must refuse rather than admit.
+    with pytest.raises(SessionInvalidated):
+        async with manager.acquire(backend, "k1"):
+            pytest.fail("acquire should refuse admit onto a marked entry")
+
+    release_leader.set()
+    await leader
+
+    # start_session was called once (for the leader) and never re-driven
+    # for the rejected admit.
+    assert backend.start_calls == ["k1"]
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_drains_tracked_via_backend_stop_session() -> None:
+    """``SandboxSessionManager.stop`` must evict tracked entries before
+    cancelling the sweeper — backend.stop_session is called for every
+    tracked (backend, key) pair, then the sweeper task is gone.
+    """
+    manager = SandboxSessionManager(
+        idle_ttl_seconds=60.0,
+        sweep_interval_seconds=60.0,
+        eviction_grace_seconds=0.5,
+    )
+    backend_a = _FakeBackend()
+    backend_b = _FakeBackend()
+
+    await manager.start()
+    try:
+        async with manager.acquire(backend_a, "ka1"):
+            pass
+        async with manager.acquire(backend_a, "ka2"):
+            pass
+        async with manager.acquire(backend_b, "kb1"):
+            pass
+    finally:
+        await manager.stop()
+
+    assert sorted(backend_a.stop_calls) == ["ka1", "ka2"], (
+        f"backend_a.stop_session must be called for both keys; got {backend_a.stop_calls}"
+    )
+    assert backend_b.stop_calls == ["kb1"], (
+        f"backend_b.stop_session must be called for its key; got {backend_b.stop_calls}"
+    )
+    assert manager._tasks == []
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_awaits_pending_tasks_before_cancelling_sweeper() -> None:
+    """``schedule_eviction`` tasks must be awaited (not cancelled) by
+    ``stop`` so the underlying ``backend.stop_session`` completes.
+    """
+    stop_session_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+    stop_session_completed = asyncio.Event()
+
+    class _SlowStopBackend(SandboxBackend):
+        def __init__(self) -> None:
+            self.start_calls: list[str] = []
+            self.stop_calls: list[str] = []
+
+        async def start_session(self, session_key: str) -> None:
+            self.start_calls.append(session_key)
+
+        async def stop_session(self, session_key: str) -> None:
+            stop_session_entered.set()
+            await release_stop.wait()
+            self.stop_calls.append(session_key)
+            stop_session_completed.set()
+
+        async def execute(
+            self,
+            code: str,
+            session_key: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout="", stderr="")
+
+        async def close(self) -> None:
+            pass
+
+    backend = _SlowStopBackend()
+    manager = SandboxSessionManager(
+        idle_ttl_seconds=60.0,
+        sweep_interval_seconds=60.0,
+        eviction_grace_seconds=1.0,
+    )
+
+    await manager.start()
+    async with manager.acquire(backend, "k1"):
+        pass
+
+    # Fire-and-forget eviction parked inside backend.stop_session.
+    manager.schedule_eviction(backend, "k1")
+    await stop_session_entered.wait()
+
+    async def run_stop() -> None:
+        await manager.stop()
+
+    stop_task = asyncio.create_task(run_stop())
+    # Give stop() a chance to begin its drain; assert it has NOT cancelled
+    # the in-flight stop_session.
+    await asyncio.sleep(0.05)
+    assert not stop_session_completed.is_set()
+
+    # Release the in-flight stop_session; stop() must observe completion.
+    release_stop.set()
+    await stop_task
+
+    assert backend.stop_calls == ["k1"], (
+        f"backend.stop_session must complete before stop returns; got {backend.stop_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_evict_drain_poll_identity_check_rejects_fresh_same_key_entry() -> None:
+    """The eviction drain-poll must identity-check the tracked entry —
+    a fresh same-key acquire after the marked entry drains and pops
+    must not be misread as the marked entry still in flight (or worse,
+    as having drained when it was actually a new admit).
+
+    Drives the race:
+    1. Acquire k1 — entry E1 inserted, in_flight=1.
+    2. evict_for_backend_key(k1) starts — E1 in_flight > 0 so it's
+       marked_for_eviction; evict enters its drain-poll loop.
+    3. Release E1 — _release pops E1 from _tracked and calls stop_session.
+    4. Schedule a fresh acquire on k1 — inserts a NEW entry E2.
+    5. Evict's drain-poll runs identity check: ``_tracked.get(key) is E1``
+       returns False (E2 is there), so E1 is correctly removed from
+       the wait set and the drain returns.
+
+    Observable: the evict call returns within the grace window AND
+    the fresh acquire does not raise (E2 is not marked_for_eviction).
+    """
+    in_first_body = asyncio.Event()
+    release_first = asyncio.Event()
+
+    manager = SandboxSessionManager(
+        max_sessions_per_backend=4,
+        eviction_grace_seconds=1.0,
+    )
+    backend = _FakeBackend()
+
+    async def first_acquire() -> None:
+        async with manager.acquire(backend, "k1"):
+            in_first_body.set()
+            await release_first.wait()
+
+    first = asyncio.create_task(first_acquire())
+    await in_first_body.wait()
+
+    async def evict() -> None:
+        await manager.evict_for_backend_key(backend, "k1")
+
+    evict_task = asyncio.create_task(evict())
+    # Yield so evict enters its drain-poll loop.
+    await asyncio.sleep(0.02)
+
+    # Release first: _release pops E1 from _tracked and calls stop_session.
+    release_first.set()
+    await first
+
+    # Fresh acquire inserts a NEW entry on the same key. The identity check
+    # in the drain-poll must see this is NOT E1 (which was popped) and let
+    # the evict_task return.
+    async with manager.acquire(backend, "k1") as session:
+        result = await session.execute("print('post-evict')")
+
+    # Evict must have completed (drain-poll did not get stuck on the
+    # fresh entry mistakenly treated as the marked one).
+    await asyncio.wait_for(evict_task, timeout=2.0)
+
+    assert result.stdout == "print('post-evict')"
+    # backend.stop_session was called exactly once — for E1 on release.
+    assert backend.stop_calls == ["k1"]

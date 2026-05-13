@@ -399,7 +399,22 @@ class SandboxBackend(ABC):
 
     @abstractmethod
     async def stop_session(self, session_key: str) -> None:
-        """Stop and clean up the sandbox session identified by session_key."""
+        """Stop and clean up the sandbox session identified by session_key.
+
+        Implementations MUST pop the session handle from the backend-local
+        ``_sessions`` map synchronously before the first ``await``. The
+        ``SandboxSessionManager`` releases its per-key lock before awaiting
+        ``stop_session``, so any implementation that awaits before popping
+        can race a concurrent same-key ``start_session`` against the same
+        ``_sessions`` slot — the new session would be overwritten or
+        shadowed by the stop in progress.
+
+        Failure semantics are best-effort: the manager logs and continues
+        on any ``Exception`` raised here. Backends that mind orphaned
+        provider-side resources (running container, billed minutes) should
+        either retry internally or rely on the provider's idle-reclamation
+        timeout — the manager will not re-drive a failed ``stop_session``.
+        """
         ...
 
     @abstractmethod
