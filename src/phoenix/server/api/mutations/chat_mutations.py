@@ -110,7 +110,7 @@ async def _resolve_inline_code_evaluator_backend(
     sandbox_config_id: Optional[strawberry.relay.GlobalID],
     language: str,
 ) -> tuple[Any, Optional[int]]:
-    from phoenix.server.sandbox import MissingSecretError, get_or_create_backend
+    from phoenix.server.sandbox import MissingSecretError, build_sandbox_backend
     from phoenix.server.sandbox.types import UnsupportedOperation
 
     if sandbox_config_id is None:
@@ -157,7 +157,7 @@ async def _resolve_inline_code_evaluator_backend(
 
         backend_type = provider.backend_type
         try:
-            sandbox_backend = await get_or_create_backend(
+            sandbox_backend = await build_sandbox_backend(
                 backend_type,
                 config=sandbox_cfg.config,
                 session=session,
@@ -283,7 +283,7 @@ class ChatCompletionMutationMixin:
                     raise BadRequest(f"Expected code evaluator, got {type_name}")
 
                 from phoenix.server.api.evaluators import CodeEvaluatorRunner
-                from phoenix.server.sandbox import MissingSecretError, get_or_create_backend
+                from phoenix.server.sandbox import MissingSecretError, build_sandbox_backend
                 from phoenix.server.sandbox.types import UnsupportedOperation
 
                 code_evaluator_version = (
@@ -351,7 +351,7 @@ class ChatCompletionMutationMixin:
 
                     if backend_type is not None:
                         try:
-                            sandbox_backend = await get_or_create_backend(
+                            sandbox_backend = await build_sandbox_backend(
                                 backend_type,
                                 config=sandbox_config,
                                 session=session,
@@ -383,10 +383,7 @@ class ChatCompletionMutationMixin:
                     evaluator_version_id=str(
                         GlobalID("CodeEvaluatorVersion", str(code_evaluator_version.id))
                     ),
-                    # Stored-evaluator names are DB-stable, so the runner falls
-                    # back to ``self._name`` for the session key; we only plumb
-                    # the manager so eviction coordination is still wired up.
-                    session_key=None,
+                    session_key=f"evaluator:{db_id}",
                     sandbox_session_manager=info.context.sandbox_session_manager,
                 )
                 eval_results = await runner.evaluate(
@@ -434,7 +431,7 @@ class ChatCompletionMutationMixin:
                     # survives rename mid-iteration (Q3 key-churn fix). When
                     # the field is unset the runner falls back to ``self._name``
                     # so older clients keep working.
-                    session_key=inline_code_evaluator.session_id,
+                    session_key=f"inline:{inline_code_evaluator.session_id}",
                     sandbox_session_manager=info.context.sandbox_session_manager,
                 )
                 eval_results = await runner.evaluate(
@@ -460,19 +457,13 @@ class ChatCompletionMutationMixin:
     ) -> StopEvaluatorSessionPayload:
         """Best-effort eviction of a sandbox session keyed by ``session_id``.
 
-        The frontend doesn't know which sandbox backend is in use, so the
-        mutation fans the eviction request out across every cached backend.
-        The manager no-ops on absent keys, so unrelated backends are unaffected.
-        Returns once the eviction request is accepted — backend.stop_session
-        may still be in progress on a background task. The server-side idle
-        TTL is the load-bearing eviction path; this mutation is the
-        sub-second optimization on intentional unmount.
+        Evicts the single ``inline:<session_id>`` key from the manager. The
+        manager no-ops on absent keys. Returns once the eviction request is
+        accepted — backend.close_session may still be in progress on a
+        background task. Provider-side max-lifetime TTLs (D8) reap any
+        orphaned variants from mid-iteration SandboxConfig changes.
         """
-        from phoenix.server.sandbox import _BACKEND_CACHE
-
         manager = info.context.sandbox_session_manager
-        # Snapshot to avoid mutation-during-iteration if the cache changes.
-        for backend in list(_BACKEND_CACHE.values()):
-            await manager.evict_for_backend_key(backend, session_id)
+        await manager.evict_for_session_key(f"inline:{session_id}")
 
         return StopEvaluatorSessionPayload(session_id=session_id, stopped=True)

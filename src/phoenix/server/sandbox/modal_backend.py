@@ -17,18 +17,31 @@ logs, or crash dumps.
 
 Session lifecycle
 -----------------
-- start_session(): creates a Modal Sandbox via Sandbox.create.aio() and
-  caches it by session_key. Sandboxes are long-lived (idle_timeout=300s,
-  hard timeout=600s).
-- stop_session(): terminates the cached sandbox via sandbox.terminate.aio().
-- execute(): runs code via sandbox.exec("python", "-c", code) inside the
-  cached session, or ephemeral (create → exec → terminate) if no session.
-- close(): terminates all cached sandboxes.
+- find_or_create_session(): looks up an existing Modal Sandbox by
+  ``provider_session_id(session_key)`` (sha256-derived deterministic name) via
+  ``Sandbox.from_name.aio``; on miss or stale handle, creates one with
+  ``Sandbox.create.aio(name=..., timeout=600, idle_timeout=300, ...)``. The
+  Modal sandbox-name namespace per-app guarantees cross-replica convergence:
+  a concurrent winner from a sibling replica surfaces as
+  ``AlreadyExistsError`` on ``create``, which is handled by re-attaching via
+  ``from_name``.
+- execute_in_session(): runs code via ``sandbox.exec.aio("python", "-c", code)``
+  against the handle previously returned by ``find_or_create_session``.
+- close_session(): looks up the sandbox by name and terminates it; a missing
+  name is treated as no-op (idempotent).
+- execute(): runs code in an ephemeral sandbox (create → exec → terminate)
+  when called without a manager-mediated session, or routes through
+  ``find_or_create_session`` + ``execute_in_session`` when a session_key is
+  supplied — preserving prior observable behavior for callers that hold
+  references to ``execute``.
+- close(): no backend-local session state to release (binding lives in
+  Modal's per-app name namespace).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
@@ -59,9 +72,12 @@ ENV_MODAL_TOKEN_SECRET = "MODAL_TOKEN_SECRET"
 class ModalSandboxBackend(SandboxBackend):
     """Sandbox backend executing code in Modal cloud sandboxes.
 
-    Supports named sessions via start_session/stop_session for sandbox reuse
-    across multiple execute() calls, or ephemeral execution (no session) which
-    spins up a fresh sandbox per call.
+    Session reuse is bound at Modal via the per-app sandbox-name namespace:
+    ``find_or_create_session(session_key)`` derives a deterministic Modal name
+    via ``provider_session_id`` (sha256 prefix of ``session_key``) and uses
+    ``Sandbox.from_name`` / ``Sandbox.create(name=...)`` so two Phoenix
+    replicas converge on a single remote sandbox without any process-local
+    binding state.
 
     Credentials are passed explicitly to the SDK via ``modal.Client.from_credentials``
     rather than via ``os.environ``. The client + app are constructed lazily on
@@ -97,15 +113,18 @@ class ModalSandboxBackend(SandboxBackend):
         self._app_name = app_name
         self._user_env: dict[str, str] = dict(user_env or {})
         self._block_network = block_network
-        self._sessions: dict[str, Sandbox] = {}
-        # SandboxSessionManager serializes start_session per (backend, session_key),
-        # so per-key locks are not maintained on the backend itself.
         self._client: Optional[Client] = None
         self._app: Optional[App] = None
         self._client_lock = asyncio.Lock()
         base_image = modal.Image.debian_slim()
         self._image: Image = base_image.pip_install(list(packages)) if packages else base_image
         self.secret_values = compose_secret_values(user_env, token_id, token_secret)
+
+    def provider_session_id(self, session_key: str) -> str:
+        # Modal restricts sandbox names to alphanumeric + ``-`` and limits
+        # length to 64 chars. sha256 hex prefix is deterministic across
+        # replicas, alphanumeric, and well under the limit at 32 chars.
+        return hashlib.sha256(session_key.encode()).hexdigest()[:32]
 
     async def _ensure_client(self) -> Client:
         """Construct (or reuse) a typed Modal Client bound to this backend's credentials.
@@ -142,7 +161,7 @@ class ModalSandboxBackend(SandboxBackend):
                 )
         return self._app
 
-    async def _create_sandbox(self) -> Sandbox:
+    async def _create_sandbox(self, *, name: Optional[str] = None) -> Sandbox:
         import modal
 
         client = await self._ensure_client()
@@ -154,27 +173,93 @@ class ModalSandboxBackend(SandboxBackend):
             "timeout": self._timeout,
             "idle_timeout": self._idle_timeout,
         }
+        if name is not None:
+            kwargs["name"] = name
         if self._user_env:
             kwargs["env"] = self._user_env
         if self._block_network:
             kwargs["block_network"] = True
         return await modal.Sandbox.create.aio(**kwargs)
 
-    async def start_session(self, session_key: str) -> None:
-        # SandboxSessionManager serializes start_session calls per (backend,
-        # session_key) — no internal lock needed here.
-        if session_key in self._sessions:
-            logger.debug(f"Modal session '{session_key}' already exists; reusing")
-            return
-        sandbox = await self._create_sandbox()
-        self._sessions[session_key] = sandbox
-        logger.debug(f"Started Modal session '{session_key}'")
+    async def _from_name_if_alive(self, name: str) -> Optional[Sandbox]:
+        """Look up a named Modal sandbox; return None if missing or stale."""
+        import modal
+        from modal.exception import NotFoundError
 
-    async def stop_session(self, session_key: str) -> None:
-        sandbox = self._sessions.pop(session_key, None)
-        if sandbox is not None:
+        client = await self._ensure_client()
+        try:
+            sandbox = await modal.Sandbox.from_name.aio(
+                self._app_name, name, client=client
+            )
+        except NotFoundError:
+            return None
+        # poll() returns None while running, else the exit code: a non-None
+        # return means the sandbox has already exited and should not be reused.
+        try:
+            returncode = await sandbox.poll.aio()
+        except Exception:
+            return None
+        if returncode is not None:
+            return None
+        return sandbox
+
+    async def find_or_create_session(self, session_key: str) -> Sandbox:
+        import modal
+        from modal.exception import AlreadyExistsError
+
+        name = self.provider_session_id(session_key)
+        existing = await self._from_name_if_alive(name)
+        if existing is not None:
+            logger.debug(f"Modal session '{name}' already exists; reusing")
+            return existing
+        try:
+            sandbox = await self._create_sandbox(name=name)
+            logger.debug(f"Created Modal session '{name}'")
+            return sandbox
+        except AlreadyExistsError:
+            # Concurrent winner from another replica claimed the name first;
+            # attach to it via from_name. The winner is by construction the
+            # one we would have created.
+            attached = await self._from_name_if_alive(name)
+            if attached is None:
+                raise
+            logger.debug(f"Modal session '{name}' won by concurrent creator; attaching")
+            return attached
+
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> ExecutionResult:
+        # ``handle`` is the Modal Sandbox returned by find_or_create_session;
+        # the type is opaque at the ABC level but always a modal.Sandbox here.
+        sandbox: Sandbox = handle  # type: ignore[assignment]
+        try:
+            return await self._exec_code(sandbox, code)
+        except Exception as exc:
+            return ExecutionResult(stdout="", stderr=str(exc), error=str(exc))
+
+    async def close_session(self, session_key: str) -> None:
+        # No backend-local bookkeeping to pop: binding lives in Modal's per-app
+        # name namespace, so the pop-before-await invariant is trivially
+        # satisfied — there is nothing to pop.
+        import modal
+        from modal.exception import NotFoundError
+
+        name = self.provider_session_id(session_key)
+        client = await self._ensure_client()
+        try:
+            sandbox = await modal.Sandbox.from_name.aio(
+                self._app_name, name, client=client
+            )
+        except NotFoundError:
+            return
+        try:
             await sandbox.terminate.aio()
-            logger.debug(f"Stopped Modal session '{session_key}'")
+            logger.debug(f"Stopped Modal session '{name}'")
+        except NotFoundError:
+            return
 
     async def _exec_code(self, sandbox: Sandbox, code: str) -> ExecutionResult:
         """Run code in a sandbox and collect stdout/stderr."""
@@ -193,22 +278,27 @@ class ModalSandboxBackend(SandboxBackend):
         session_key: str,
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
+        # Direct one-shot path (no manager mediation). When the caller supplies
+        # a session_key, route through the find_or_create_session path so
+        # repeated direct execute() calls with the same key reuse the remote
+        # sandbox; otherwise spin an ephemeral sandbox.
         try:
-            sandbox = self._sessions.get(session_key)
-            if sandbox is not None:
+            if session_key:
+                handle = await self.find_or_create_session(session_key)
+                return await self.execute_in_session(handle, code, timeout)
+            sandbox = await self._create_sandbox()
+            try:
                 return await self._exec_code(sandbox, code)
-            else:
-                sandbox = await self._create_sandbox()
-                try:
-                    return await self._exec_code(sandbox, code)
-                finally:
-                    await sandbox.terminate.aio()
+            finally:
+                await sandbox.terminate.aio()
         except Exception as exc:
             return ExecutionResult(stdout="", stderr=str(exc), error=str(exc))
 
     async def close(self) -> None:
-        for key in list(self._sessions):
-            await self.stop_session(key)
+        # Session bindings live in Modal's per-app name namespace; there is no
+        # backend-local session map to drain. The SandboxSessionManager calls
+        # close_session() for each tracked key during shutdown.
+        return None
 
 
 class ModalAdapter(SandboxAdapter):

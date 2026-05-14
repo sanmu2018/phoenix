@@ -41,8 +41,6 @@ from phoenix.server.api.types.SandboxConfig import (
 )
 from phoenix.server.sandbox import (
     _SANDBOX_ADAPTERS,
-    invalidate_backend_cache,
-    invalidate_backend_cache_for_key,
     is_reserved_credential_name,
 )
 
@@ -222,12 +220,6 @@ class SandboxConfigMutationMixin:
                 f"A sandbox config with name {input.name!r} already exists for this provider"
             )
 
-        # New configs produce new config-hashes naturally, but a prior
-        # version-of-this-row's wrapper may still sit in _BACKEND_CACHE under
-        # the old hash. Invalidate the backend_type so any orphaned wrapper
-        # is closed (and its sessions evicted through the manager).
-        await invalidate_backend_cache(provider.backend_type)
-
         return CreateSandboxConfigPayload(
             sandbox_config=to_gql_sandbox_config(row),
             query=Query(),
@@ -257,7 +249,6 @@ class SandboxConfigMutationMixin:
         ):
             raise BadRequest("timeout must be a positive integer")
 
-        backend_type_for_invalidation: str | None = None
         try:
             async with info.context.db() as session:
                 config_id = from_global_id_with_expected_type(
@@ -274,7 +265,6 @@ class SandboxConfigMutationMixin:
                     row.name = validated_name
                 if input.description is not strawberry.UNSET:
                     row.description = input.description
-                provider: models.SandboxProvider | None = None
                 if input.config is not strawberry.UNSET:
                     config_dict: dict[str, Any] = (
                         dict(cast(dict[str, Any], input.config)) if input.config is not None else {}
@@ -305,27 +295,8 @@ class SandboxConfigMutationMixin:
 
                 await session.flush()
                 await session.refresh(row)
-                # Capture backend_type for cache invalidation. Look it up via
-                # the provider row if the config-edit branch didn't already
-                # fetch it — every update path needs invalidation because
-                # any field change (name, timeout, enabled, description) may
-                # affect cached wrappers' behavior assumptions.
-                if provider is None:
-                    provider = await session.scalar(
-                        select(models.SandboxProvider).where(
-                            models.SandboxProvider.id == row.sandbox_provider_id
-                        )
-                    )
-                if provider is not None:
-                    backend_type_for_invalidation = provider.backend_type
         except (PostgreSQLIntegrityError, SQLiteIntegrityError):
             raise Conflict("A sandbox config with that name already exists for this provider")
-
-        # Updating a config produces a new effective_config hash, so the
-        # cached wrapper under the OLD hash is now orphaned. Evict it
-        # through the manager (drains in-flight sessions) before close().
-        if backend_type_for_invalidation is not None:
-            await invalidate_backend_cache(backend_type_for_invalidation)
 
         return UpdateSandboxConfigPayload(
             sandbox_config=to_gql_sandbox_config(row),
@@ -341,33 +312,15 @@ class SandboxConfigMutationMixin:
         input: DeleteSandboxConfigInput,
     ) -> DeleteSandboxConfigPayload:
         """Delete a SandboxConfig by GlobalID."""
-        from sqlalchemy import select
-
         config_id = from_global_id_with_expected_type(
             input.id,
             expected_type_name=SandboxConfig.__name__,
         )
-        backend_type_for_invalidation: str | None = None
         async with info.context.db() as session:
             row = await session.get(models.SandboxConfig, config_id)
             if row is None:
                 raise NotFound(f"SandboxConfig not found: {config_id}")
-            # Capture backend_type BEFORE deletion so we can fire
-            # invalidation after the transaction commits.
-            provider = await session.scalar(
-                select(models.SandboxProvider).where(
-                    models.SandboxProvider.id == row.sandbox_provider_id
-                )
-            )
-            if provider is not None:
-                backend_type_for_invalidation = provider.backend_type
             await session.delete(row)
-
-        # The deleted config's hash never re-resolves, so the cached
-        # wrapper under that hash is now strictly orphaned. Evict its
-        # sessions through the manager and close the wrapper immediately.
-        if backend_type_for_invalidation is not None:
-            await invalidate_backend_cache(backend_type_for_invalidation)
 
         return DeleteSandboxConfigPayload(deleted_id=input.id, query=Query())
 
@@ -432,12 +385,6 @@ class SandboxConfigMutationMixin:
                     on_conflict=OnConflict.DO_UPDATE,
                 )
             )
-        # Key-level fan-out covers shared credential_specs (e.g.,
-        # VERCEL_TOKEN shared between VERCEL_PYTHON and
-        # VERCEL_TYPESCRIPT). Per-backend_type
-        # invalidation remains as a defense-in-depth backstop.
-        await invalidate_backend_cache_for_key(key)
-        await invalidate_backend_cache(backend_type)
         return SetSandboxCredentialPayload(backend_type=backend_type, key=key, query=Query())
 
     @strawberry.mutation(
@@ -456,8 +403,4 @@ class SandboxConfigMutationMixin:
 
         async with info.context.db() as session:
             await session.execute(sa.delete(models.Secret).where(models.Secret.key == key))
-        # Key-level fan-out covers shared credential_specs; per-backend_type call
-        # remains as a defense-in-depth backstop.
-        await invalidate_backend_cache_for_key(key)
-        await invalidate_backend_cache(backend_type)
         return DeleteSandboxCredentialPayload(backend_type=backend_type, key=key, query=Query())

@@ -1,9 +1,23 @@
 """
 Vercel sandbox backend.
 
-Session-capable — start_session() creates an AsyncSandbox and caches it by
-session_key. execute() reuses the cached sandbox if one exists for the key,
-otherwise spins up an ephemeral sandbox (create → run_command → stop).
+Session-capable — ``find_or_create_session(session_key)`` returns an
+``AsyncSandbox`` handle that is reused across calls keyed by ``session_key``.
+``execute()`` remains the direct, no-manager one-shot path (create →
+run_command → stop) for callers that do not go through ``SandboxSessionManager``.
+
+Vercel's ``AsyncSandbox.create`` accepts no client-supplied id / name /
+metadata / tags, and ``AsyncSandbox.list`` filters only by time range — there
+is no provider-native lookup primitive that lets two replicas converge on the
+same remote sandbox for a given ``session_key``. So Vercel uses a
+**module-level** ``_session_id_map: dict[session_key, sandbox_id]`` shared
+across ephemeral ``VercelSandboxBackend`` wrapper instances in the same
+process. Cross-replica Vercel binding is deferred (see notes.md in
+``_work/cross-replica-deterministic-sandbox-session-reuse``): experiments
+are jobs-bound to a single replica today, so process-local binding is
+correctness-equivalent to a DB table for the currently-shipping consumer.
+A DB-backed mapping can be added later without changing this adapter's
+contract — ``find_or_create_session`` is identical.
 
 Requires the ``vercel`` extra (``vercel>=0.5.8``). The SDK import is lazy (in
 ``VercelSandboxBackend._create_sandbox``) so the module remains importable
@@ -32,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, TypedDict
 
 from starlette.datastructures import Secret
@@ -81,17 +96,76 @@ _LANGUAGE_CONFIGS: dict[str, _LanguageConfig] = {
 }
 _DEFAULT_LANGUAGE = "TYPESCRIPT"
 
+# D8 max-lifetime ceiling for Vercel sandboxes. Vercel's SDK accepts an int
+# (interpreted as **milliseconds**) or a ``timedelta``; we pass a ``timedelta``
+# to keep the unit unambiguous at the call site. 600 s == 10 min, well under
+# Vercel's 45 min hard cap and above the SDK's 5 min default.
+_VERCEL_CREATE_TIMEOUT = timedelta(seconds=600)
+
+# ---------------------------------------------------------------------------
+# Process-local Vercel session binding.
+#
+# Vercel's ``CreateSandboxRequest`` accepts no client-supplied id / name /
+# metadata / tags, and ``AsyncSandbox.list`` filters only by time range — so
+# unlike Modal (name namespace), E2B (metadata list), or Daytona (label list),
+# Vercel has no provider-native primitive that lets two Phoenix replicas
+# converge on a single remote sandbox for a given ``session_key``. We bind
+# ``session_key -> sandbox_id`` in a **module-level** dict that is shared
+# across every ephemeral ``VercelSandboxBackend`` wrapper in the same process,
+# guarded by Phoenix's canonical per-key asyncio.Lock pattern (lazy-insert +
+# double-checked locking) so concurrent same-key callers serialize on the
+# slot.
+#
+# Cross-replica Vercel binding is deferred per
+# ``_work/cross-replica-deterministic-sandbox-session-reuse/notes.md``:
+# experiments are jobs-bound to a single replica today, so this is
+# correctness-equivalent to a DB table for the currently-shipping consumer.
+# When a DB-backed mapping ships, it slots in behind ``find_or_create_session``
+# without changing the adapter contract.
+# ---------------------------------------------------------------------------
+
+_session_id_map: dict[str, str] = {}
+_session_id_locks: dict[str, asyncio.Lock] = {}
+_global_lock = asyncio.Lock()
+
+
+async def _get_key_lock(session_key: str) -> asyncio.Lock:
+    """Return the per-key asyncio.Lock for ``session_key``, creating on miss.
+
+    Lazy-insert under the module-level ``_global_lock`` so two concurrent
+    first-time callers cannot each install a different Lock and end up
+    holding non-equivalent slots. Pairs with ``_session_id_map``: callers
+    that pop the map entry on close also pop the lock entry to bound
+    ``_session_id_locks`` growth.
+    """
+    async with _global_lock:
+        return _session_id_locks.setdefault(session_key, asyncio.Lock())
+
+
+# Vercel statuses that mean the sandbox is no longer usable. ``stop`` is a
+# user-visible terminal state; ``failed``/``aborted`` are SDK-emitted error
+# terminals; ``snapshotting`` is a transitional state where the sandbox is
+# being stopped as a side effect of snapshot creation. ``pending``/``running``
+# are the live states we will accept on reconnect. ``stopping`` is treated as
+# stale: the sandbox is on its way down and reusing it races the teardown.
+_VERCEL_DEAD_STATUSES: frozenset[str] = frozenset(
+    {"stopped", "stopping", "failed", "aborted", "snapshotting"}
+)
+
 
 class VercelSandboxBackend(SandboxBackend):
     """Sandbox backend executing code via Vercel Sandbox (vercel >= 0.5.8).
 
-    Supports named sessions via start_session/stop_session for sandbox reuse
-    across multiple execute() calls, or ephemeral execution (no session) which
-    spins up a fresh sandbox per call.
+    Session reuse is bound in a **process-local** ``_session_id_map`` keyed by
+    the opaque ``session_key`` (see module-level comment for the cross-replica
+    caveat). ``find_or_create_session`` reconnects via
+    ``AsyncSandbox.get(sandbox_id=...)`` when a mapping exists and the remote
+    sandbox is alive; on miss or stale, it calls ``AsyncSandbox.create(...)``
+    and records ``sandbox.sandbox_id`` under the same per-key lock.
 
     Credentials: the access-token triple ``token``/``project_id``/``team_id``
-    is forwarded directly to ``AsyncSandbox.create`` as explicit kwargs. No
-    ``os.environ`` mutation.
+    is forwarded directly to ``AsyncSandbox.create`` / ``AsyncSandbox.get`` as
+    explicit kwargs. No ``os.environ`` mutation.
 
     Network policy: pass ``internet_access`` as ``True`` (allow-all),
     ``False`` (deny-all), or ``None`` (omit — let the SDK default apply).
@@ -119,9 +193,9 @@ class VercelSandboxBackend(SandboxBackend):
         self._user_env: dict[str, str] = dict(user_env or {})
         self._packages: list[str] = list(packages) if packages else []
         self._internet_access = internet_access
-        self._sessions: dict[str, AsyncSandbox] = {}
-        # SandboxSessionManager serializes start_session per (backend, session_key),
-        # so per-key locks are not maintained on the backend itself.
+        # Session bindings live in the module-level ``_session_id_map`` so they
+        # survive across ephemeral ``VercelSandboxBackend`` wrappers; the per-
+        # backend ``_sessions`` map of older versions is gone.
         self.secret_values = compose_secret_values(
             user_env,
             self._token,
@@ -152,11 +226,48 @@ class VercelSandboxBackend(SandboxBackend):
             "token": str(self._token),
             "project_id": str(self._project_id),
             "team_id": str(self._team_id),
+            # D8: hard-coded max-lifetime ceiling so a hard-crashed Phoenix
+            # process cannot leak provider-side sandboxes indefinitely. The
+            # Vercel SDK interprets int ``timeout`` as milliseconds; we pass
+            # a ``timedelta`` to make the unit unambiguous at the call site.
+            "timeout": _VERCEL_CREATE_TIMEOUT,
         }
         network_policy = self._network_policy()
         if network_policy is not None:
             create_kwargs["network_policy"] = network_policy
         return await AsyncSandbox.create(**create_kwargs)
+
+    async def _get_sandbox(self, sandbox_id: str) -> AsyncSandbox:
+        """Reconnect to an existing Vercel sandbox by id, honoring this
+        backend's resolved credentials.
+
+        The SDK's ``AsyncSandbox.get`` constructs a fresh ops client from the
+        provided credentials, so passing them explicitly mirrors the
+        no-os.environ-mutation invariant of ``_create_sandbox``.
+        """
+        from vercel.sandbox import AsyncSandbox
+
+        return await AsyncSandbox.get(
+            sandbox_id=sandbox_id,
+            token=str(self._token),
+            project_id=str(self._project_id),
+            team_id=str(self._team_id),
+        )
+
+    @staticmethod
+    def _is_alive(sandbox: AsyncSandbox) -> bool:
+        """Return True if ``sandbox`` is in a usable (live) state.
+
+        Vercel's ``SandboxStatus`` enum values are exposed as lowercase
+        strings (``"running"``, ``"stopped"``, ...). We compare on the string
+        form so the check is robust to the StrEnum representation. Anything
+        in ``_VERCEL_DEAD_STATUSES`` is treated as stale.
+        """
+        try:
+            status = str(sandbox.status)
+        except Exception:
+            return False
+        return status not in _VERCEL_DEAD_STATUSES
 
     async def _install_packages(self, sandbox: AsyncSandbox) -> None:
         """Run language-routed install for configured packages before user code.
@@ -186,49 +297,135 @@ class VercelSandboxBackend(SandboxBackend):
                 f"{cmd} install {self._packages!r} failed (exit {result.exit_code}): {stderr}"
             )
 
-    async def start_session(self, session_key: str) -> None:
-        # SandboxSessionManager serializes start_session calls per (backend,
-        # session_key) — no internal lock needed here. The module-level
-        # _VERCEL_OIDC_ENV_LOCK still serializes env-mutation in
-        # _create_sandbox; that is independent of session creation dedup.
-        if session_key in self._sessions:
-            logger.debug(f"Vercel session '{session_key}' already exists; reusing")
-            return
-        sandbox = await self._create_sandbox()
-        try:
-            await self._install_packages(sandbox)
-        except Exception:
-            # Install failed — the sandbox is live but unusable. Stop and
-            # close it before re-raising so we don't leak a billable
-            # Vercel resource that lingers until the SDK's idle timeout.
-            try:
-                await sandbox.stop()
-            except Exception:
-                logger.debug(
-                    f"Error stopping Vercel sandbox after install failure for "
-                    f"session '{session_key}'",
-                    exc_info=True,
-                )
-            try:
-                await sandbox.client.aclose()
-            except Exception:
-                logger.debug(
-                    f"Error closing Vercel client after install failure for "
-                    f"session '{session_key}'",
-                    exc_info=True,
-                )
-            raise
-        self._sessions[session_key] = sandbox
-        logger.debug(f"Started Vercel session '{session_key}'")
+    async def find_or_create_session(self, session_key: str) -> AsyncSandbox:
+        """Return an ``AsyncSandbox`` bound to ``session_key`` (process-local).
 
-    async def stop_session(self, session_key: str) -> None:
-        sandbox = self._sessions.pop(session_key, None)
-        if sandbox is not None:
+        Idempotent under the same ``session_key`` within a single Phoenix
+        process: a second call returns the same remote sandbox via
+        ``AsyncSandbox.get`` reconnect. On stale (dead status, or any error
+        from ``get``) the binding is dropped and a fresh sandbox is created.
+        Cross-process / cross-replica convergence is **not** provided — see
+        the module-level docstring.
+        """
+        key_lock = await _get_key_lock(session_key)
+        async with key_lock:
+            existing_id = _session_id_map.get(session_key)
+            if existing_id is not None:
+                try:
+                    sandbox = await self._get_sandbox(existing_id)
+                except Exception:
+                    logger.debug(
+                        "Vercel find_or_create_session: get(sandbox_id=%s) failed "
+                        "for key=%r; treating as stale and recreating",
+                        existing_id,
+                        session_key,
+                        exc_info=True,
+                    )
+                    sandbox = None
+                if sandbox is not None and self._is_alive(sandbox):
+                    logger.debug(f"Vercel session '{session_key}' reused")
+                    return sandbox
+                # Stale binding — drop it so the create-below path can claim
+                # a fresh sandbox_id atomically under the same per-key lock.
+                _session_id_map.pop(session_key, None)
+
+            sandbox = await self._create_sandbox()
+            try:
+                await self._install_packages(sandbox)
+            except Exception:
+                # Install failed — the sandbox is live but unusable. Stop and
+                # close it before re-raising so we don't leak a billable
+                # Vercel resource that lingers until the SDK's idle timeout.
+                try:
+                    await sandbox.stop()
+                except Exception:
+                    logger.debug(
+                        f"Error stopping Vercel sandbox after install failure for "
+                        f"session '{session_key}'",
+                        exc_info=True,
+                    )
+                try:
+                    await sandbox.client.aclose()
+                except Exception:
+                    logger.debug(
+                        f"Error closing Vercel client after install failure for "
+                        f"session '{session_key}'",
+                        exc_info=True,
+                    )
+                raise
+            _session_id_map[session_key] = sandbox.sandbox_id
+            logger.debug(
+                "Vercel session '%s' created (sandbox_id=%s)",
+                session_key,
+                sandbox.sandbox_id,
+            )
+            return sandbox
+
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> ExecutionResult:
+        # ``handle`` is the AsyncSandbox returned by find_or_create_session;
+        # the type is opaque at the ABC level but always a vercel AsyncSandbox
+        # here.
+        sandbox: AsyncSandbox = handle  # type: ignore[assignment]
+        try:
+            session_env: Optional[dict[str, str]] = self._user_env or None
+            return await self._exec_code(sandbox, code, env=session_env)
+        except Exception as exc:
+            return ExecutionResult(stdout="", stderr=str(exc), error=str(exc))
+
+    async def close_session(self, session_key: str) -> None:
+        """Release the binding for ``session_key`` and best-effort stop the
+        remote sandbox.
+
+        Pop-before-await invariant: the ``_session_id_map`` entry and the
+        per-key lock entry are popped synchronously under the per-key lock,
+        before the first ``await`` on a remote operation, so a concurrent
+        same-key ``find_or_create_session`` cannot overlap a teardown in
+        progress on the same slot.
+        """
+        key_lock = await _get_key_lock(session_key)
+        async with key_lock:
+            sandbox_id = _session_id_map.pop(session_key, None)
+            # Pop the per-key lock under the same critical section so
+            # ``_session_id_locks`` does not grow unboundedly across the
+            # frontend's per-mount UUID churn.
+            _session_id_locks.pop(session_key, None)
+            if sandbox_id is None:
+                return
+            try:
+                sandbox = await self._get_sandbox(sandbox_id)
+            except Exception:
+                logger.debug(
+                    "Vercel close_session: get(sandbox_id=%s) failed for key=%r; "
+                    "treating as already-absent",
+                    sandbox_id,
+                    session_key,
+                    exc_info=True,
+                )
+                return
             try:
                 await sandbox.stop()
+            except Exception:
+                logger.debug(
+                    "Vercel close_session: stop failed for sandbox_id=%s key=%r",
+                    sandbox_id,
+                    session_key,
+                    exc_info=True,
+                )
+            try:
                 await sandbox.client.aclose()
             except Exception:
-                logger.debug(f"Error stopping Vercel session '{session_key}'", exc_info=True)
+                logger.debug(
+                    "Vercel close_session: client.aclose failed for sandbox_id=%s "
+                    "key=%r",
+                    sandbox_id,
+                    session_key,
+                    exc_info=True,
+                )
             logger.debug(f"Stopped Vercel session '{session_key}'")
 
     async def _exec_code(
@@ -253,29 +450,33 @@ class VercelSandboxBackend(SandboxBackend):
         session_key: str,
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
+        # Direct one-shot path (no manager mediation). The session_key is
+        # accepted for ABC parity but not consulted: this path always runs
+        # ephemeral (create → install → exec → stop) so two direct callers
+        # holding distinct wrapper instances don't accidentally share a
+        # remote sandbox via the module-level map. Manager-mediated reuse
+        # goes through ``find_or_create_session`` + ``execute_in_session``.
         try:
             session_env: Optional[dict[str, str]] = self._user_env or None
-            sandbox = self._sessions.get(session_key)
-            if sandbox is not None:
+            sandbox = await self._create_sandbox()
+            try:
+                await self._install_packages(sandbox)
                 return await self._exec_code(sandbox, code, env=session_env)
-            else:
-                # Ephemeral: create, install (if configured), exec, stop.
-                sandbox = await self._create_sandbox()
+            finally:
                 try:
-                    await self._install_packages(sandbox)
-                    return await self._exec_code(sandbox, code, env=session_env)
-                finally:
-                    try:
-                        await sandbox.stop()
-                        await sandbox.client.aclose()
-                    except Exception:
-                        pass
+                    await sandbox.stop()
+                    await sandbox.client.aclose()
+                except Exception:
+                    pass
         except Exception as exc:
             return ExecutionResult(stdout="", stderr=str(exc), error=str(exc))
 
     async def close(self) -> None:
-        for key in list(self._sessions):
-            await self.stop_session(key)
+        # Session bindings live in the module-level ``_session_id_map``, which
+        # outlives any single wrapper instance — the manager calls
+        # ``close_session`` per tracked key during shutdown. Nothing to drain
+        # at the wrapper level.
+        return None
 
 
 def _resolve_internet_access(config: Mapping[str, Any]) -> Optional[bool]:

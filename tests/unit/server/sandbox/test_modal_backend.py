@@ -22,8 +22,10 @@ def _make_modal_mock() -> MagicMock:
     """Mock the modal SDK surface used by ModalSandboxBackend.
 
     Covers both sync and async (``.aio``) call shapes for ``Client.from_credentials``,
-    ``App.lookup``, and ``Sandbox.create`` — Phoenix uses the async wrappers
-    everywhere, but the sync forms are mocked for completeness.
+    ``App.lookup``, ``Sandbox.create``, and ``Sandbox.from_name`` — Phoenix
+    uses the async wrappers everywhere, but the sync forms are mocked for
+    completeness. ``modal.exception`` exposes the named exception classes
+    that ``find_or_create_session`` / ``close_session`` catch.
     """
     modal = MagicMock()
     modal.App.lookup = MagicMock()
@@ -33,6 +35,18 @@ def _make_modal_mock() -> MagicMock:
     modal.Client.from_credentials.aio = AsyncMock(return_value=MagicMock())
     modal.Sandbox.create = MagicMock()
     modal.Sandbox.create.aio = AsyncMock(return_value=MagicMock())
+    modal.Sandbox.from_name = MagicMock()
+    modal.Sandbox.from_name.aio = AsyncMock()
+
+    class _NotFoundError(Exception):
+        pass
+
+    class _AlreadyExistsError(Exception):
+        pass
+
+    modal.exception = MagicMock()
+    modal.exception.NotFoundError = _NotFoundError
+    modal.exception.AlreadyExistsError = _AlreadyExistsError
     return modal
 
 
@@ -57,7 +71,7 @@ async def test_user_env_reaches_sandbox_create_as_env_kwarg(
 ) -> None:
     """user_env must reach Sandbox.create.aio() as `env`, not `env_dict`; absent when empty."""
     modal_mock = _make_modal_mock()
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
 
         backend = ModalSandboxBackend(
@@ -80,7 +94,7 @@ def test_pip_install_invoked_only_when_packages_present() -> None:
     installed_image = MagicMock()
     slim_image.pip_install.return_value = installed_image
 
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalAdapter
 
         adapter = ModalAdapter()
@@ -116,7 +130,7 @@ async def test_block_network_kwarg_forwarding(
 ) -> None:
     """block_network=True reaches SDK; block_network=False omits the kwarg entirely."""
     modal_mock = _make_modal_mock()
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
 
         backend = ModalSandboxBackend(
@@ -164,7 +178,7 @@ def test_build_backend_sets_block_network_from_internet_access(
 ) -> None:
     """ModalAdapter.build_backend translates internet_access.mode → backend._block_network."""
     modal_mock = _make_modal_mock()
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalAdapter
 
         adapter = ModalAdapter()
@@ -175,7 +189,7 @@ def test_build_backend_sets_block_network_from_internet_access(
 def test_build_backend_requires_both_tokens() -> None:
     """Missing either token must raise ValueError at adapter.build_backend time."""
     modal_mock = _make_modal_mock()
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalAdapter
 
         adapter = ModalAdapter()
@@ -202,7 +216,7 @@ async def test_credentials_passed_to_sdk_via_explicit_client(
     sentinel_app = MagicMock(name="modal-app")
     modal_mock.App.lookup.aio = AsyncMock(return_value=sentinel_app)
 
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
 
         backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
@@ -225,7 +239,7 @@ async def test_client_construction_is_memoized_across_sandbox_creates() -> None:
     """Two _create_sandbox() calls on the same backend must reuse the same client + app,
     not re-construct them per call."""
     modal_mock = _make_modal_mock()
-    with patch.dict(sys.modules, {"modal": modal_mock}):
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
         from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
 
         backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
@@ -275,3 +289,177 @@ async def test_execute_strips_ansi_in_raised_exception_path() -> None:
 
     assert result.error == "provider error"
     assert result.stderr == "provider error"
+
+
+# ---------------------------------------------------------------------------
+# provider_session_id — sha256 prefix override (Modal-specific)
+# ---------------------------------------------------------------------------
+
+
+def test_provider_session_id_is_sha256_prefix_alphanumeric_le_32_chars() -> None:
+    """Modal names are restricted to alphanumeric + ``-`` and limited to 64
+    chars. ``provider_session_id`` produces a 32-char hex prefix (alphanumeric
+    by definition, well under the limit) and is deterministic across calls.
+    """
+    modal_mock = _make_modal_mock()
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        sample = [
+            "evaluator:42",
+            "evaluator:43",
+            "inline:abc-123",
+            "inline:def-456",
+            "very/long/key/with-special-chars and spaces!!!",
+        ]
+        ids = [backend.provider_session_id(k) for k in sample]
+
+    # Determinism: same input → same output across calls.
+    for key, derived in zip(sample, ids):
+        assert backend.provider_session_id(key) == derived
+    # Length / charset invariants.
+    for derived in ids:
+        assert len(derived) <= 32
+        assert derived.isalnum()
+    # Distinct inputs → distinct outputs across the sample set.
+    assert len(set(ids)) == len(ids)
+
+
+# ---------------------------------------------------------------------------
+# find_or_create_session — Modal name-uniqueness binding + D8 TTL kwargs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_or_create_session_reuses_existing_named_sandbox() -> None:
+    """from_name returns an alive sandbox → reuse; create.aio NOT awaited."""
+    modal_mock = _make_modal_mock()
+    existing = MagicMock()
+    existing.poll = MagicMock()
+    existing.poll.aio = AsyncMock(return_value=None)  # None == still running
+    modal_mock.Sandbox.from_name.aio = AsyncMock(return_value=existing)
+
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        handle = await backend.find_or_create_session("evaluator:42")
+
+    modal_mock.Sandbox.from_name.aio.assert_awaited()
+    modal_mock.Sandbox.create.aio.assert_not_awaited()
+    assert handle is existing
+
+
+@pytest.mark.asyncio
+async def test_find_or_create_session_creates_when_from_name_raises_not_found() -> None:
+    """from_name → NotFoundError → fall through to create with name kwarg."""
+    modal_mock = _make_modal_mock()
+    modal_mock.Sandbox.from_name.aio = AsyncMock(side_effect=modal_mock.exception.NotFoundError())
+
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        handle = await backend.find_or_create_session("evaluator:42")
+
+    modal_mock.Sandbox.create.aio.assert_awaited_once()
+    create_kwargs = modal_mock.Sandbox.create.aio.call_args.kwargs
+    # D8 TTL kwargs hard-coded on every create.
+    assert create_kwargs["timeout"] == 600
+    assert create_kwargs["idle_timeout"] == 300
+    # Name derives from provider_session_id, NOT the raw session_key.
+    expected_name = backend.provider_session_id("evaluator:42")
+    assert create_kwargs["name"] == expected_name
+    assert handle is modal_mock.Sandbox.create.aio.return_value
+
+
+@pytest.mark.asyncio
+async def test_find_or_create_session_attaches_on_already_exists_race() -> None:
+    """Concurrent winner from another replica → AlreadyExistsError on create
+    → attach via a second from_name."""
+    modal_mock = _make_modal_mock()
+    # First from_name: not found (miss). Second from_name (after the race):
+    # returns the concurrent winner.
+    winner = MagicMock()
+    winner.poll = MagicMock()
+    winner.poll.aio = AsyncMock(return_value=None)
+    modal_mock.Sandbox.from_name.aio = AsyncMock(
+        side_effect=[
+            modal_mock.exception.NotFoundError(),
+            winner,
+        ]
+    )
+    modal_mock.Sandbox.create.aio = AsyncMock(side_effect=modal_mock.exception.AlreadyExistsError())
+
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        handle = await backend.find_or_create_session("evaluator:42")
+
+    assert modal_mock.Sandbox.from_name.aio.await_count == 2
+    assert handle is winner
+
+
+@pytest.mark.asyncio
+async def test_find_or_create_session_is_idempotent_within_one_backend() -> None:
+    """Two consecutive find_or_create_session(key) calls return the same handle.
+
+    The Modal-side binding lives in the per-app name namespace; the second
+    call resolves through from_name and never enters the create branch.
+    """
+    modal_mock = _make_modal_mock()
+    existing = MagicMock()
+    existing.poll = MagicMock()
+    existing.poll.aio = AsyncMock(return_value=None)
+    # First call: from_name MISS, then create succeeds. Second call: from_name HIT.
+    modal_mock.Sandbox.from_name.aio = AsyncMock(
+        side_effect=[
+            modal_mock.exception.NotFoundError(),
+            existing,
+        ]
+    )
+    created = MagicMock()
+    modal_mock.Sandbox.create.aio = AsyncMock(return_value=created)
+
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        first = await backend.find_or_create_session("evaluator:42")
+        second = await backend.find_or_create_session("evaluator:42")
+
+    assert modal_mock.Sandbox.create.aio.await_count == 1
+    assert first is created
+    assert second is existing
+
+
+@pytest.mark.asyncio
+async def test_close_session_terminates_named_sandbox() -> None:
+    """``close_session`` looks up by provider_session_id and terminates it."""
+    modal_mock = _make_modal_mock()
+    sandbox = MagicMock()
+    sandbox.terminate = MagicMock()
+    sandbox.terminate.aio = AsyncMock()
+    modal_mock.Sandbox.from_name.aio = AsyncMock(return_value=sandbox)
+
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        await backend.close_session("evaluator:42")
+
+    sandbox.terminate.aio.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_session_is_idempotent_on_unknown_name() -> None:
+    modal_mock = _make_modal_mock()
+    modal_mock.Sandbox.from_name.aio = AsyncMock(side_effect=modal_mock.exception.NotFoundError())
+    with patch.dict(sys.modules, {"modal": modal_mock, "modal.exception": modal_mock.exception}):
+        from phoenix.server.sandbox.modal_backend import ModalSandboxBackend
+
+        backend = ModalSandboxBackend(token_id=_TOKEN_ID, token_secret=_TOKEN_SECRET)
+        # Must NOT raise.
+        await backend.close_session("evaluator:never-bound")

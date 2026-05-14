@@ -55,24 +55,38 @@ _EMPTY_MAPPING = InputMapping(literal_mapping={}, path_mapping={})
 
 
 class _SlowBackend(SandboxBackend):
-    """Backend whose execute sleeps indefinitely; stop_session is tracked."""
+    """Backend whose execute sleeps indefinitely; close_session is tracked.
 
-    # CodeEvaluatorRunner reads secret_values to seed SandboxSecretMasker;
-    # real backends get this attached by build_sandbox_backend(). Direct
-    # test fixtures must declare it themselves.
+    Implements the post-refactor ABC: ``find_or_create_session`` /
+    ``execute_in_session`` / ``close_session`` / ``execute`` / ``close``.
+    The runner's back-compat (no-manager) path routes through ``execute``,
+    so that's where the sleep lives.
+    """
+
+    # CodeEvaluatorRunner reads secret_values to seed SandboxSecretMasker.
     secret_values: frozenset[str] = frozenset()
+    family: str = "TEST"
 
-    def __init__(self, stop_raises: Exception | None = None) -> None:
-        self.stop_session_calls: list[str] = []
-        self._stop_raises = stop_raises
+    def __init__(self, close_raises: Exception | None = None) -> None:
+        self.close_session_calls: list[str] = []
+        self._close_raises = close_raises
 
-    async def start_session(self, session_key: str) -> None:
-        pass
+    async def find_or_create_session(self, session_key: str) -> object:
+        return object()
 
-    async def stop_session(self, session_key: str) -> None:
-        self.stop_session_calls.append(session_key)
-        if self._stop_raises is not None:
-            raise self._stop_raises
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: int | None = None,
+    ) -> ExecutionResult:
+        await asyncio.sleep(60)
+        return ExecutionResult(stdout='"pass"', stderr="", error=None)
+
+    async def close_session(self, session_key: str) -> None:
+        self.close_session_calls.append(session_key)
+        if self._close_raises is not None:
+            raise self._close_raises
 
     async def execute(
         self,
@@ -90,18 +104,26 @@ class _SlowBackend(SandboxBackend):
 class _FastBackend(SandboxBackend):
     """Backend that returns immediately with a configurable result."""
 
-    # See _SlowBackend.secret_values for rationale.
     secret_values: frozenset[str] = frozenset()
+    family: str = "TEST"
 
     def __init__(self, result: ExecutionResult) -> None:
         self._result = result
-        self.stop_session_calls: list[str] = []
+        self.close_session_calls: list[str] = []
 
-    async def start_session(self, session_key: str) -> None:
-        pass
+    async def find_or_create_session(self, session_key: str) -> object:
+        return object()
 
-    async def stop_session(self, session_key: str) -> None:
-        self.stop_session_calls.append(session_key)
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: int | None = None,
+    ) -> ExecutionResult:
+        return self._result
+
+    async def close_session(self, session_key: str) -> None:
+        self.close_session_calls.append(session_key)
 
     async def execute(
         self,
@@ -131,7 +153,7 @@ class TestTimeoutWrapper:
         assert results[0]["error"] == "timeout"
 
     @pytest.mark.asyncio
-    async def test_slow_backend_schedules_stop_session(self) -> None:
+    async def test_slow_backend_schedules_close_session(self) -> None:
         backend = _SlowBackend()
         runner = _make_runner(backend, timeout=1)
         await runner.evaluate(
@@ -141,15 +163,14 @@ class TestTimeoutWrapper:
             output_configs=[_categorical_config()],
         )
 
-        # Allow the fire-and-forget task to run
         await asyncio.sleep(0)
-        assert len(backend.stop_session_calls) == 1
+        assert len(backend.close_session_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_stop_session_exception_during_timeout_does_not_propagate(
+    async def test_close_session_exception_during_timeout_does_not_propagate(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        backend = _SlowBackend(stop_raises=RuntimeError("stop failed"))
+        backend = _SlowBackend(close_raises=RuntimeError("close failed"))
         runner = _make_runner(backend, timeout=1)
 
         with caplog.at_level(logging.WARNING):
@@ -159,12 +180,11 @@ class TestTimeoutWrapper:
                 name="test",
                 output_configs=[_categorical_config()],
             )
-            # Let the fire-and-forget task run and log
             await asyncio.sleep(0)
 
         assert len(results) == 1
         assert results[0]["error"] == "timeout"
-        assert any("stop_session" in r.message for r in caplog.records)
+        assert any("close_session" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_fast_backend_result_passes_through_unchanged(self) -> None:
@@ -180,7 +200,7 @@ class TestTimeoutWrapper:
         assert len(results) == 1
         assert results[0]["error"] is None
         assert results[0]["label"] == "pass"
-        assert len(backend.stop_session_calls) == 0
+        assert len(backend.close_session_calls) == 0
 
     @pytest.mark.asyncio
     async def test_fast_backend_with_error_field_passes_through_unchanged(self) -> None:
@@ -195,25 +215,23 @@ class TestTimeoutWrapper:
 
         assert len(results) == 1
         assert results[0]["error"] == "runtime error"
-        assert len(backend.stop_session_calls) == 0
+        assert len(backend.close_session_calls) == 0
 
 
 class TestTimeoutTeardownKeying:
     """Regression tests for the timeout teardown path.
 
-    These guard two bugs:
+    Guards two bugs:
 
     1. Wrong session key (resource leak). When ``session_key`` is overridden
        (the frontend-generated UUID path), the fire-and-forget teardown must
        use the override key — not ``self._name``. Otherwise the backend's
-       ``stop_session`` looks up a non-existent key and leaks the sandbox.
+       ``close_session`` looks up a non-existent key and leaks the sandbox.
 
     2. Manager state desync (dead-session reuse). With a manager plumbed in,
-       teardown must route through ``evict_for_backend_key`` so the manager's
-       ``_tracked`` entry is removed atomically with stopping the backend.
-       A direct ``backend.stop_session`` would kill the sandbox while leaving
-       a stale ``_TrackedSession`` whose next ``acquire()`` skips
-       ``start_session`` and yields a handle to a dead sandbox.
+       teardown must route through ``schedule_eviction(session_key)`` so the
+       manager's ``_tracked`` entry is removed atomically with the
+       provider-side teardown.
     """
 
     @pytest.mark.asyncio
@@ -237,19 +255,15 @@ class TestTimeoutTeardownKeying:
             name="test",
             output_configs=[_categorical_config()],
         )
-        # Let the fire-and-forget teardown task run
         await asyncio.sleep(0)
 
-        # stop_session must be called with the override key — NOT self._name.
-        # The backend's session dict is keyed by the override, so calling
-        # stop_session("test-runner") would silently no-op and leak the sandbox.
-        assert backend.stop_session_calls == [override]
+        # close_session must be called with the override key — NOT self._name.
+        assert backend.close_session_calls == [override]
 
     @pytest.mark.asyncio
     async def test_manager_teardown_evicts_tracked_entry(self) -> None:
         backend = _SlowBackend()
         manager = SandboxSessionManager()
-        # Compress eviction-grace so the test doesn't sleep for the default 5s.
         manager.eviction_grace_seconds = 0.05
 
         runner = CodeEvaluatorRunner(
@@ -270,17 +284,10 @@ class TestTimeoutTeardownKeying:
             output_configs=[_categorical_config()],
         )
 
-        # Wait for the fire-and-forget eviction task to complete. Poll briefly
-        # because evict_for_backend_key awaits the eviction-grace window even
-        # when in_flight_count is already zero.
         for _ in range(50):
             await asyncio.sleep(0.01)
-            if backend.stop_session_calls and not manager._tracked:
+            if backend.close_session_calls and not manager._tracked:
                 break
 
-        # Manager must have stopped the backend session AND removed its
-        # tracked entry. If either condition fails, the next acquire() for
-        # the same key would either skip start_session (state desync) or
-        # double-start (if stop succeeded but tracking lingered).
-        assert backend.stop_session_calls == ["test-runner"]
+        assert backend.close_session_calls == ["test-runner"]
         assert manager._tracked == {}

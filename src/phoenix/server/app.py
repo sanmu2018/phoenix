@@ -703,19 +703,6 @@ def _lifespan(
             await stack.enter_async_context(db_disk_usage_monitor)
             await stack.enter_async_context(experiment_runner)
             await stack.enter_async_context(sandbox_session_manager)
-            # Wire invalidation paths (``invalidate_backend_cache``,
-            # ``invalidate_backend_cache_for_key``, ``close_all_backends``)
-            # through the manager so they evict in-flight sessions before
-            # closing backends. Module-level handle is used because
-            # ``close_all_backends`` runs as a shutdown callback that has
-            # no GraphQL info / FastAPI request scope.
-            from phoenix.server.sandbox import (
-                register_session_manager,
-                unregister_session_manager,
-            )
-
-            register_session_manager(sandbox_session_manager)
-            stack.callback(unregister_session_manager)
             if docs_mcp_toolset is not None:
                 await stack.enter_async_context(docs_mcp_toolset)
             if scaffolder_config:

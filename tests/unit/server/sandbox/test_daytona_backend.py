@@ -1,21 +1,29 @@
-"""Unit tests for DaytonaSandboxBackend code_run kwarg correctness."""
+"""Unit tests for DaytonaSandboxBackend code_run kwarg correctness and
+``find_or_create_session`` provider-side binding via the ``phoenix_session_key``
+label.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import sys
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.datastructures import Secret
+
+from phoenix.server.sandbox.daytona_backend import (
+    _AUTO_ARCHIVE_INTERVAL_MIN,
+    _AUTO_STOP_INTERVAL_MIN,
+    _LABEL_SESSION_KEY,
+)
 
 _API_KEY = Secret("test-key")
 _ALT_KEY = Secret("key")
 
 
 class _CodeRunParams:
-    """Minimal stand-in for daytona_sdk.CodeRunParams."""
-
     def __init__(
         self,
         argv: list[str] | None = None,
@@ -26,23 +34,25 @@ class _CodeRunParams:
 
 
 class _CreateSandboxFromSnapshotParams:
-    """Minimal stand-in for daytona_sdk.CreateSandboxFromSnapshotParams."""
-
     def __init__(
         self,
         language: str | None = None,
         network_block_all: bool | None = None,
+        labels: dict[str, str] | None = None,
+        auto_stop_interval: int | None = None,
+        auto_archive_interval: int | None = None,
         **kwargs: object,
     ) -> None:
         self.language = language
         self.network_block_all = network_block_all
+        self.labels = labels
+        self.auto_stop_interval = auto_stop_interval
+        self.auto_archive_interval = auto_archive_interval
         for key, value in kwargs.items():
             setattr(self, key, value)
 
 
 class _DaytonaConfig:
-    """Minimal stand-in for daytona_sdk.DaytonaConfig."""
-
     def __init__(
         self,
         api_key: str | None = None,
@@ -56,7 +66,6 @@ class _DaytonaConfig:
 
 
 def _make_daytona_mocks() -> tuple[MagicMock, MagicMock]:
-    """Return (daytona_sdk mock, daytona_sdk.common.process mock — kept for legacy import path)."""
     process_mod = MagicMock()
     process_mod.CodeRunParams = _CodeRunParams
 
@@ -67,11 +76,36 @@ def _make_daytona_mocks() -> tuple[MagicMock, MagicMock]:
 
     workspace = MagicMock()
     workspace.process.code_run = AsyncMock(return_value=MagicMock(result="ok", exit_code=0))
+    workspace.id = "sb-new"
+    workspace.state = "STARTED"
     client = daytona_mod.AsyncDaytona.return_value
     client.create = AsyncMock(return_value=workspace)
     client.delete = AsyncMock()
+    client.get = AsyncMock()
+    # Default: list returns an empty result.
+    list_response = MagicMock()
+    list_response.items = []
+    client.list = AsyncMock(return_value=list_response)
 
     return daytona_mod, process_mod
+
+
+def _patch_sandbox_state(daytona_mod: MagicMock) -> Any:
+    """Make ``from daytona_api_client_async.models.sandbox_state import SandboxState`` resolvable."""
+    state_mod = MagicMock()
+    state_mod.SandboxState = MagicMock()
+    state_mod.SandboxState.STARTED = "STARTED"
+    pkg = MagicMock()
+    pkg.models = MagicMock()
+    pkg.models.sandbox_state = state_mod
+    return patch.dict(
+        sys.modules,
+        {
+            "daytona_api_client_async": pkg,
+            "daytona_api_client_async.models": pkg.models,
+            "daytona_api_client_async.models.sandbox_state": state_mod,
+        },
+    )
 
 
 class TestCodeRunParamsKwarg:
@@ -94,25 +128,16 @@ class TestCodeRunParamsKwarg:
 
         workspace = daytona_mod.AsyncDaytona.return_value.create.return_value
         call_args = workspace.process.code_run.call_args
-        assert call_args is not None, "code_run was never called"
-
-        assert "envs" not in call_args.kwargs, (
-            f"code_run received deprecated 'envs' kwarg: {call_args.kwargs}"
-        )
-        assert "params" in call_args.kwargs, (
-            f"code_run missing 'params' kwarg; got: {call_args.kwargs}"
-        )
+        assert call_args is not None
+        assert "envs" not in call_args.kwargs
+        assert "params" in call_args.kwargs
         params = call_args.kwargs["params"]
-        assert isinstance(params, _CodeRunParams), (
-            f"params is {type(params)}, expected _CodeRunParams"
-        )
-        assert params.env == user_env, f"params.env={params.env!r}, expected {user_env!r}"
+        assert isinstance(params, _CodeRunParams)
+        assert params.env == user_env
 
     @pytest.mark.asyncio
     async def test_execute_empty_user_env_passes_none_env(self) -> None:
-        """Empty user_env must produce params.env=None, not an empty dict."""
         daytona_mod, process_mod = _make_daytona_mocks()
-
         modules = {
             "daytona_sdk": daytona_mod,
             "daytona_sdk.common": MagicMock(),
@@ -125,20 +150,42 @@ class TestCodeRunParamsKwarg:
             await backend.execute("1+1", session_key="s1")
 
         workspace = daytona_mod.AsyncDaytona.return_value.create.return_value
-        call_args = workspace.process.code_run.call_args
-        params = call_args.kwargs["params"]
-        assert isinstance(params, _CodeRunParams)
-        assert params.env is None, (
-            f"Expected params.env=None for empty user_env, got {params.env!r}"
-        )
+        params = workspace.process.code_run.call_args.kwargs["params"]
+        assert params.env is None
+
+
+class TestCreateParamsD8AndLabelKwargs:
+    """``find_or_create_session`` must tag the create params with the D8 TTL
+    kwargs (``auto_stop_interval=5``, ``auto_archive_interval=15``) and the
+    ``phoenix_session_key`` label so cross-replica list-by-label converges.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_params_carry_d8_ttl_and_session_label(self) -> None:
+        daytona_mod, process_mod = _make_daytona_mocks()
+        modules = {
+            "daytona_sdk": daytona_mod,
+            "daytona_sdk.common": MagicMock(),
+            "daytona_sdk.common.process": process_mod,
+        }
+        with patch.dict(sys.modules, modules), _patch_sandbox_state(daytona_mod):
+            from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+            backend = DaytonaSandboxBackend(api_key=_API_KEY)
+            await backend.find_or_create_session("evaluator:42")
+
+        client = daytona_mod.AsyncDaytona.return_value
+        params = client.create.call_args.args[0]
+        assert isinstance(params, _CreateSandboxFromSnapshotParams)
+        assert params.auto_stop_interval == _AUTO_STOP_INTERVAL_MIN == 5
+        assert params.auto_archive_interval == _AUTO_ARCHIVE_INTERVAL_MIN == 15
+        assert params.labels == {_LABEL_SESSION_KEY: "evaluator:42"}
 
 
 class TestNetworkBlockAll:
     @pytest.mark.asyncio
     async def test_deny_mode_passes_network_block_all_true(self) -> None:
-        """internet_access.mode='deny' → client.create() receives network_block_all=True."""
         daytona_mod, process_mod = _make_daytona_mocks()
-
         modules = {
             "daytona_sdk": daytona_mod,
             "daytona_sdk.common": MagicMock(),
@@ -151,20 +198,13 @@ class TestNetworkBlockAll:
             await backend.execute("1", session_key="s1")
 
         create_call = daytona_mod.AsyncDaytona.return_value.create.call_args
-        assert create_call is not None, "client.create() was never called"
         params = create_call.args[0] if create_call.args else create_call.kwargs.get("params")
-        assert isinstance(params, _CreateSandboxFromSnapshotParams), (
-            f"Expected CreateSandboxFromSnapshotParams; got {type(params)}"
-        )
-        assert params.network_block_all is True, (
-            f"Expected network_block_all=True; got {params.network_block_all!r}"
-        )
+        assert isinstance(params, _CreateSandboxFromSnapshotParams)
+        assert params.network_block_all is True
 
     @pytest.mark.asyncio
     async def test_allow_mode_omits_network_block_all(self) -> None:
-        """internet_access.mode='allow' → network_block_all NOT set on create params."""
         daytona_mod, process_mod = _make_daytona_mocks()
-
         modules = {
             "daytona_sdk": daytona_mod,
             "daytona_sdk.common": MagicMock(),
@@ -179,40 +219,32 @@ class TestNetworkBlockAll:
         create_call = daytona_mod.AsyncDaytona.return_value.create.call_args
         params = create_call.args[0] if create_call.args else create_call.kwargs.get("params")
         assert isinstance(params, _CreateSandboxFromSnapshotParams)
-        assert params.network_block_all is None, (
-            f"network_block_all should be unset when mode != 'deny'; got {params.network_block_all!r}"
-        )
+        assert params.network_block_all is None
 
     @pytest.mark.asyncio
-    async def test_start_session_deny_passes_network_block_all(self) -> None:
-        """start_session also sets network_block_all=True on create params when deny mode."""
+    async def test_find_or_create_session_deny_passes_network_block_all(self) -> None:
+        """``find_or_create_session`` also sets ``network_block_all=True`` on
+        create params under deny mode."""
         daytona_mod, process_mod = _make_daytona_mocks()
-
         modules = {
             "daytona_sdk": daytona_mod,
             "daytona_sdk.common": MagicMock(),
             "daytona_sdk.common.process": process_mod,
         }
-        with patch.dict(sys.modules, modules):
+        with patch.dict(sys.modules, modules), _patch_sandbox_state(daytona_mod):
             from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
 
             backend = DaytonaSandboxBackend(api_key=_ALT_KEY, network_block_all=True)
-            await backend.start_session("sess")
+            await backend.find_or_create_session("sess")
 
-        create_call = daytona_mod.AsyncDaytona.return_value.create.call_args
-        params = create_call.args[0] if create_call.args else create_call.kwargs.get("params")
+        params = daytona_mod.AsyncDaytona.return_value.create.call_args.args[0]
         assert isinstance(params, _CreateSandboxFromSnapshotParams)
-        assert params.network_block_all is True, (
-            f"Expected network_block_all=True in start_session path; got {params.network_block_all!r}"
-        )
+        assert params.network_block_all is True
 
 
 class TestEphemeralTeardown:
-    """Verify that ephemeral execute() always removes the workspace, even on failure or cancel."""
-
     @pytest.mark.asyncio
     async def test_remove_called_when_code_run_raises(self) -> None:
-        """client.remove() is called exactly once when code_run raises."""
         daytona_mod, process_mod = _make_daytona_mocks()
         client = daytona_mod.AsyncDaytona.return_value
         client.create.return_value.process.code_run = AsyncMock(
@@ -236,7 +268,6 @@ class TestEphemeralTeardown:
 
     @pytest.mark.asyncio
     async def test_remove_called_on_cancellation(self) -> None:
-        """client.remove() is called when the coroutine is cancelled via asyncio.wait_for."""
         daytona_mod, process_mod = _make_daytona_mocks()
         client = daytona_mod.AsyncDaytona.return_value
 
@@ -265,12 +296,6 @@ class TestEphemeralTeardown:
 
 
 class TestBuildBackendCredentialValidation:
-    """``DaytonaPythonAdapter.build_backend`` must fail closed when api_key
-    is missing, instead of letting the SDK fall back to ``DAYTONA_API_KEY``
-    autodiscovery from process env (which differs from Phoenix's declared
-    ``DAYTONA_API_KEY`` and would bypass Phoenix's resolution).
-    """
-
     def test_missing_api_key_raises_value_error(self) -> None:
         from phoenix.server.sandbox.daytona_backend import DaytonaPythonAdapter
 
@@ -287,17 +312,9 @@ class TestBuildBackendCredentialValidation:
 
 
 class TestTypescriptRouting:
-    """Verify that ``language='TYPESCRIPT'`` routes ``_create_params`` to
-    ``CodeLanguage.TYPESCRIPT`` and ``_install_packages`` to a Node-side
-    ``npm install`` invocation with argv-shape safety (no shell interpolation).
-    """
-
     @pytest.mark.asyncio
     async def test_create_params_uses_typescript_language(self) -> None:
-        """language='TYPESCRIPT' → CreateSandboxFromSnapshotParams(language='typescript')."""
         daytona_mod, process_mod = _make_daytona_mocks()
-
-        # CodeLanguage.TYPESCRIPT is "typescript" upstream; mock the enum.
         daytona_mod.CodeLanguage = MagicMock()
         daytona_mod.CodeLanguage.PYTHON = "python"
         daytona_mod.CodeLanguage.TYPESCRIPT = "typescript"
@@ -314,20 +331,15 @@ class TestTypescriptRouting:
             await backend.execute("console.log('hi')", session_key="s1")
 
         create_call = daytona_mod.AsyncDaytona.return_value.create.call_args
-        assert create_call is not None, "client.create() was never called"
         params = create_call.args[0] if create_call.args else create_call.kwargs.get("params")
-        assert isinstance(params, _CreateSandboxFromSnapshotParams), (
-            f"Expected CreateSandboxFromSnapshotParams; got {type(params)}"
-        )
-        assert params.language == "typescript", (
-            f"Expected language=CodeLanguage.TYPESCRIPT (='typescript'); got {params.language!r}"
-        )
+        assert isinstance(params, _CreateSandboxFromSnapshotParams)
+        assert params.language == "typescript"
 
     @pytest.mark.asyncio
     async def test_install_packages_uses_npm_argv_shape(self) -> None:
-        """language='TYPESCRIPT' + packages → generated TS source runs
-        ``spawnSync('npm', ['install', ...pkgs])`` with packages embedded as a
-        JSON array literal — NOT shell-string interpolation, NOT pip."""
+        """``find_or_create_session`` runs the install on create; assert the
+        generated TS source uses ``spawnSync('npm', ['install', ...])`` with
+        packages embedded as a JSON array literal."""
         daytona_mod, process_mod = _make_daytona_mocks()
         daytona_mod.CodeLanguage = MagicMock()
         daytona_mod.CodeLanguage.PYTHON = "python"
@@ -338,7 +350,7 @@ class TestTypescriptRouting:
             "daytona_sdk.common": MagicMock(),
             "daytona_sdk.common.process": process_mod,
         }
-        with patch.dict(sys.modules, modules):
+        with patch.dict(sys.modules, modules), _patch_sandbox_state(daytona_mod):
             from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
 
             backend = DaytonaSandboxBackend(
@@ -346,16 +358,17 @@ class TestTypescriptRouting:
                 packages=["is-odd"],
                 language="TYPESCRIPT",
             )
-            await backend.start_session("sess-ts")
+            await backend.find_or_create_session("sess-ts")
 
         workspace = daytona_mod.AsyncDaytona.return_value.create.return_value
-        # First code_run call is the install; second (if any) is execution.
-        # start_session only runs the install.
-        assert workspace.process.code_run.call_count >= 1, (
-            "expected at least one code_run invocation (install)"
-        )
-        install_call = workspace.process.code_run.call_args_list[0]
-        install_source = install_call.args[0] if install_call.args else ""
+        assert workspace.process.code_run.call_count >= 1
+        install_source = workspace.process.code_run.call_args_list[0].args[0]
+        assert "npm" in install_source
+        assert "install" in install_source
+        assert "pip install" not in install_source
+        assert '["is-odd"]' in install_source
+        assert ("spawnSync" in install_source) or ("execFileSync" in install_source)
+        assert "cwd: '/tmp'" in install_source or 'cwd: "/tmp"' in install_source
 
         assert "npm" in install_source, (
             f"expected 'npm' in generated install source; got: {install_source!r}"
@@ -395,6 +408,101 @@ class TestTypescriptRouting:
             f"in /tmp/node_modules (the first entry in Node's resolve path on "
             f"Daytona's TS workspace); got: {install_source!r}"
         )
+
+
+class TestFindOrCreateSessionConvergence:
+    """Cross-wrapper provider-side binding: list-by-label, then connect (get)."""
+
+    @pytest.mark.asyncio
+    async def test_two_fresh_wrappers_converge_on_one_remote_sandbox(self) -> None:
+        """A second wrapper finds the first's sandbox via list-by-label
+        and reuses it instead of creating a new one."""
+        daytona_mod, process_mod = _make_daytona_mocks()
+
+        provider_state: dict[str, MagicMock] = {}
+
+        def _client_factory() -> MagicMock:
+            client = MagicMock()
+            client.create = AsyncMock()
+            client.get = AsyncMock()
+            client.delete = AsyncMock()
+
+            async def _create_side(params: Any) -> MagicMock:
+                key = params.labels[_LABEL_SESSION_KEY]
+                sb = MagicMock()
+                sb.id = f"sb-{key}"
+                sb.state = "STARTED"
+                sb.process.code_run = AsyncMock(return_value=MagicMock(exit_code=0))
+                provider_state[key] = sb
+                return sb
+
+            client.create.side_effect = _create_side
+
+            async def _get_side(sandbox_id: str) -> MagicMock:
+                for sb in provider_state.values():
+                    if sb.id == sandbox_id:
+                        return sb
+                raise RuntimeError("not found")
+
+            client.get.side_effect = _get_side
+
+            async def _list_side(**kwargs: Any) -> MagicMock:
+                labels = kwargs.get("labels") or {}
+                key = labels.get(_LABEL_SESSION_KEY)
+                resp = MagicMock()
+                resp.items = [provider_state[key]] if key in provider_state else []
+                return resp
+
+            client.list = AsyncMock(side_effect=_list_side)
+            return client
+
+        client_a = _client_factory()
+        client_b = _client_factory()
+
+        modules = {
+            "daytona_sdk": daytona_mod,
+            "daytona_sdk.common": MagicMock(),
+            "daytona_sdk.common.process": process_mod,
+        }
+        with patch.dict(sys.modules, modules), _patch_sandbox_state(daytona_mod):
+            from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+            backend_a = DaytonaSandboxBackend(api_key=_API_KEY)
+            backend_b = DaytonaSandboxBackend(api_key=_API_KEY)
+            with patch.object(backend_a, "_get_client", return_value=client_a):
+                handle_a = await backend_a.find_or_create_session("ev:1")
+            with patch.object(backend_b, "_get_client", return_value=client_b):
+                handle_b = await backend_b.find_or_create_session("ev:1")
+
+        client_a.create.assert_awaited_once()
+        client_b.create.assert_not_awaited()
+        client_b.get.assert_awaited_once()
+        assert handle_a.id == handle_b.id
+
+
+class TestCloseSession:
+    @pytest.mark.asyncio
+    async def test_close_session_deletes_all_matches(self) -> None:
+        daytona_mod, process_mod = _make_daytona_mocks()
+        client = daytona_mod.AsyncDaytona.return_value
+        sb_a = MagicMock(id="sb-a")
+        sb_b = MagicMock(id="sb-b")
+        list_resp = MagicMock()
+        list_resp.items = [sb_a, sb_b]
+        client.list = AsyncMock(return_value=list_resp)
+
+        modules = {
+            "daytona_sdk": daytona_mod,
+            "daytona_sdk.common": MagicMock(),
+            "daytona_sdk.common.process": process_mod,
+        }
+        with patch.dict(sys.modules, modules):
+            from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+            backend = DaytonaSandboxBackend(api_key=_API_KEY)
+            await backend.close_session("ev:1")
+
+        assert client.delete.await_count == 2
 
 
 def test_to_execution_result_strips_ansi_on_success() -> None:
@@ -438,3 +546,19 @@ async def test_execute_strips_ansi_in_raised_exception_path() -> None:
 
     assert result.error == "boom"
     assert result.stderr == "boom"
+
+
+def test_provider_session_id_default_is_passthrough() -> None:
+    """Daytona does not override ``provider_session_id`` — input == output."""
+    daytona_mod, process_mod = _make_daytona_mocks()
+    modules = {
+        "daytona_sdk": daytona_mod,
+        "daytona_sdk.common": MagicMock(),
+        "daytona_sdk.common.process": process_mod,
+    }
+    with patch.dict(sys.modules, modules):
+        from phoenix.server.sandbox.daytona_backend import DaytonaSandboxBackend
+
+        backend = DaytonaSandboxBackend(api_key=_API_KEY)
+        for key in ("evaluator:42", "inline:abc-123", "x" * 200):
+            assert backend.provider_session_id(key) == key

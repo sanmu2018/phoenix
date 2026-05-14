@@ -373,13 +373,32 @@ def compose_secret_values(
     return frozenset((user_env or {}).values()) | frozenset(str(c) for c in credentials if c)
 
 
+#: Sentinel handle returned by ``BaseNoSessionBackend.find_or_create_session``.
+#: Stateless adapters (WASM, Deno) have no provider-side session to bind to —
+#: the manager still stores a handle in its tracked-session table, so we
+#: return this opaque singleton rather than ``None`` to keep the type uniform
+#: and to make accidental dereferencing obvious in logs.
+_NO_SESSION_HANDLE: object = object()
+
+
 class SandboxBackend(ABC):
     """
     Protocol for sandbox backends.
 
-    Surface: execute + start_session + stop_session + close.
-    Session reuse is controlled by the caller-provided session_key passed to
-    execute(). start_session/stop_session manage the lifecycle explicitly.
+    Surface: ``execute`` + ``find_or_create_session`` + ``execute_in_session``
+    + ``close_session`` + ``close``.
+
+    Session reuse is bound at the provider, not in Phoenix process state:
+    ``find_or_create_session(session_key)`` returns an opaque remote handle
+    that the adapter understands (e.g. a Modal ``Sandbox``, an E2B
+    ``AsyncSandbox``, a Daytona ``Sandbox``, or a sentinel for stateless
+    backends). Callers pass that handle back to ``execute_in_session`` to
+    run code against the specific remote session. ``close_session`` releases
+    the binding for one ``session_key``.
+
+    ``execute(...)`` remains the direct, no-manager one-shot path used by
+    callers that don't need session reuse (and by stateless backends, which
+    delegate ``execute_in_session`` to it under the hood).
 
     ``secret_values`` is the union of user-env plaintexts and provider
     credential plaintexts that ``CodeEvaluatorRunner`` will mask out of
@@ -393,27 +412,77 @@ class SandboxBackend(ABC):
     secret_values: frozenset[str] = frozenset()
 
     @abstractmethod
-    async def start_session(self, session_key: str) -> None:
-        """Start (or reuse) a sandbox session identified by session_key."""
+    async def find_or_create_session(self, session_key: str) -> object:
+        """Return an opaque remote handle for the session identified by ``session_key``.
+
+        Idempotent under the same ``session_key``: a second call with the same
+        key MUST return the same remote session (either by lookup of an
+        existing handle in backend-local bookkeeping, or by provider-native
+        list/get on a stable identifier derived from ``session_key`` via
+        ``provider_session_id``). Two replicas of Phoenix calling this method
+        with the same ``session_key`` against the same provider must converge
+        on a single remote sandbox where the provider supports it (Modal: by
+        name; E2B/Daytona: by metadata-list). Adapters whose provider does not
+        expose cross-process binding (currently Vercel) document the limit
+        on their override.
+
+        The returned value is opaque to the caller — it is passed back to
+        ``execute_in_session`` unchanged. Adapters return the SDK-native
+        session object (e.g. ``modal.Sandbox``, ``e2b.AsyncSandbox``,
+        ``daytona.Sandbox``). ``BaseNoSessionBackend`` returns a sentinel
+        handle.
+
+        ``session_key`` is opaque to the adapter: callers compose it at the
+        call site (e.g. ``f"evaluator:{evaluator.id}"``). Adapters that need
+        to sanitize the key for provider char-class or length constraints do
+        so via ``provider_session_id``.
+        """
         ...
 
     @abstractmethod
-    async def stop_session(self, session_key: str) -> None:
-        """Stop and clean up the sandbox session identified by session_key.
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> ExecutionResult:
+        """Execute ``code`` against a remote session referenced by ``handle``.
 
-        Implementations MUST pop the session handle from the backend-local
-        ``_sessions`` map synchronously before the first ``await``. The
-        ``SandboxSessionManager`` releases its per-key lock before awaiting
-        ``stop_session``, so any implementation that awaits before popping
-        can race a concurrent same-key ``start_session`` against the same
-        ``_sessions`` slot — the new session would be overwritten or
-        shadowed by the stop in progress.
+        ``handle`` is the value previously returned by
+        ``find_or_create_session``. Adapters must not look up the session via
+        a backend-local ``_sessions[session_key]`` map for manager-mediated
+        execution — the manager passes the handle directly so that wrapper
+        identity is not load-bearing for session dispatch.
 
-        Failure semantics are best-effort: the manager logs and continues
-        on any ``Exception`` raised here. Backends that mind orphaned
+        User-supplied environment variables are set at ``build_backend()``
+        time via the ``user_env`` argument and carried by the adapter for the
+        life of the session; there is no per-call env override by design.
+        """
+        ...
+
+    @abstractmethod
+    async def close_session(self, session_key: str) -> None:
+        """Release the binding for ``session_key`` and stop the remote session.
+
+        Idempotent: a no-op when ``session_key`` is absent from backend-local
+        bookkeeping.
+
+        Implementations MUST pop the session entry from any backend-local
+        bookkeeping (e.g. a ``_sessions[session_key]`` dict) synchronously
+        before the first ``await``. The ``SandboxSessionManager`` releases
+        its per-key lock before awaiting ``close_session``, so any
+        implementation that awaits before popping can race a concurrent
+        same-key ``find_or_create_session`` against the same backend-local
+        slot — the new session would be overwritten or shadowed by the close
+        in progress.
+
+        Failure semantics are best-effort: the manager logs and continues on
+        any ``Exception`` raised here. Backends that mind orphaned
         provider-side resources (running container, billed minutes) should
         either retry internally or rely on the provider's idle-reclamation
-        timeout — the manager will not re-drive a failed ``stop_session``.
+        timeout (configured per-provider via the D8 hard-coded TTL kwargs in
+        ``find_or_create_session``) — the manager will not re-drive a failed
+        ``close_session``.
         """
         ...
 
@@ -426,6 +495,10 @@ class SandboxBackend(ABC):
     ) -> ExecutionResult:
         """Execute code in the sandbox session identified by session_key.
 
+        Direct one-shot path that does not require a previously-obtained
+        handle. Manager-mediated execution goes through
+        ``find_or_create_session`` + ``execute_in_session`` instead.
+
         User-supplied environment variables are set at build_backend() time
         via the `user_env` argument and carried by the adapter for the life
         of the session. There is no per-call env override by design.
@@ -437,20 +510,49 @@ class SandboxBackend(ABC):
         """Release all resources held by this backend."""
         ...
 
+    def provider_session_id(self, session_key: str) -> str:
+        """Map an opaque ``session_key`` to the identifier the provider sees.
+
+        Must be deterministic across calls and processes: two Phoenix replicas
+        that compute ``provider_session_id`` from the same ``session_key``
+        must produce identical output so that provider-side list/lookup
+        converges on the same remote sandbox.
+
+        The default implementation returns ``session_key`` unchanged. Override
+        only when the provider has char-class or length restrictions on its
+        sandbox identifiers (e.g. Modal restricts names to alphanumeric and
+        ``-`` and limits length, so its adapter overrides this with a
+        sha256-based digest).
+        """
+        return session_key
+
 
 class BaseNoSessionBackend(SandboxBackend):
     """
-    Mixin for stateless sandbox backends (e.g. WASM, Vercel).
+    Mixin for stateless sandbox backends (e.g. WASM, Deno).
 
-    Provides no-op start_session and stop_session implementations.
-    Subclasses only need to implement execute() and close().
+    ``find_or_create_session`` returns a sentinel handle — there is no
+    provider-side session to bind to. ``execute_in_session`` delegates to
+    ``execute``. ``close_session`` is a no-op. Subclasses only need to
+    implement ``execute`` and ``close``.
     """
 
-    async def start_session(self, session_key: str) -> None:
-        pass
+    async def find_or_create_session(self, session_key: str) -> object:
+        return _NO_SESSION_HANDLE
 
-    async def stop_session(self, session_key: str) -> None:
-        pass
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> ExecutionResult:
+        # Stateless backends carry no per-session remote state; route through
+        # the direct one-shot path. ``session_key`` is unused on the manager
+        # side here because the manager only stores the sentinel handle.
+        return await self.execute(code, session_key="", timeout=timeout)
+
+    async def close_session(self, session_key: str) -> None:
+        return None
 
 
 class SandboxAdapter(ABC):

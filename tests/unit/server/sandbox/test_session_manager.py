@@ -1,14 +1,13 @@
-"""Unit tests for SandboxSessionManager — happy-path coverage of each
-verification bullet in Phase 1 of the
-``sandbox-session-manager-playground-session-reuse`` work item.
+"""Unit tests for ``SandboxSessionManager`` under the post-refactor shape.
 
-Test surface (one happy-path test per verification bullet):
-- ``test_acquire_populates_session_on_first_acquire_and_reuses``
-- ``test_idle_ttl_evicts_when_inflight_zero``
-- ``test_idle_ttl_does_not_evict_when_inflight_nonzero``
-- ``test_acquire_raises_session_limit_exceeded``
-- ``test_no_op_for_stateless_backend``
-- ``test_daemontask_stop_cancels_sweeper_within_grace``
+``_tracked`` and ``_key_locks`` are keyed on the opaque ``session_key``.
+``acquire(backend, session_key)`` invokes
+``backend.find_or_create_session(session_key)``, stores the returned opaque
+handle on the tracked entry, and routes ``session.execute`` through
+``backend.execute_in_session(handle, code, timeout=...)``. Eviction is by
+opaque key (``evict_for_session_key``) or by adapter family
+(``evict_for_provider_family``); capacity caps are enforced per family via
+``max_sessions_per_provider``.
 """
 
 from __future__ import annotations
@@ -32,22 +31,54 @@ from phoenix.server.sandbox.types import (
 )
 
 
+class _FakeHandle:
+    """Opaque per-key remote handle the fake backend hands back."""
+
+    def __init__(self, session_key: str) -> None:
+        self.session_key = session_key
+
+
 class _FakeBackend(SandboxBackend):
-    """In-memory session-capable fake backend with start/stop call counters."""
+    """In-memory session-capable fake backend.
+
+    Records ``find_or_create_session`` / ``close_session`` calls and the
+    handles passed back through ``execute_in_session`` so tests can assert
+    on lifecycle invariants without standing up a real provider SDK.
+    """
+
+    # Default for tests that don't override; matches the adapter family
+    # the manager reads via ``getattr(backend, "family", type(...).__name__)``.
+    family: str = "FAKE"
 
     def __init__(self) -> None:
-        self.start_calls: list[str] = []
-        self.stop_calls: list[str] = []
-        self.execute_calls: list[tuple[str, str, Optional[int]]] = []
-        self._sessions: dict[str, str] = {}
+        self.find_calls: list[str] = []
+        self.close_calls: list[str] = []
+        self.execute_in_session_calls: list[tuple[str, str, Optional[int]]] = []
+        self._sessions: dict[str, _FakeHandle] = {}
 
-    async def start_session(self, session_key: str) -> None:
-        self.start_calls.append(session_key)
-        self._sessions[session_key] = "live"
+    async def find_or_create_session(self, session_key: str) -> object:
+        self.find_calls.append(session_key)
+        handle = self._sessions.get(session_key)
+        if handle is None:
+            handle = _FakeHandle(session_key)
+            self._sessions[session_key] = handle
+        return handle
 
-    async def stop_session(self, session_key: str) -> None:
-        self.stop_calls.append(session_key)
+    async def execute_in_session(
+        self,
+        handle: object,
+        code: str,
+        timeout: Optional[int] = None,
+    ) -> ExecutionResult:
+        assert isinstance(handle, _FakeHandle)
+        self.execute_in_session_calls.append((handle.session_key, code, timeout))
+        return ExecutionResult(stdout=code, stderr="")
+
+    async def close_session(self, session_key: str) -> None:
+        # Pop-before-await: synchronously remove the binding before any
+        # subsequent await would run, mirroring the real adapter contract.
         self._sessions.pop(session_key, None)
+        self.close_calls.append(session_key)
 
     async def execute(
         self,
@@ -55,7 +86,6 @@ class _FakeBackend(SandboxBackend):
         session_key: str,
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
-        self.execute_calls.append((code, session_key, timeout))
         return ExecutionResult(stdout=code, stderr="")
 
     async def close(self) -> None:
@@ -63,7 +93,9 @@ class _FakeBackend(SandboxBackend):
 
 
 class _StatelessFakeBackend(BaseNoSessionBackend):
-    """Stateless fake backend — start/stop are inherited no-ops."""
+    """Stateless fake backend — inherits ``find_or_create_session`` /
+    ``execute_in_session`` / ``close_session`` from ``BaseNoSessionBackend``.
+    """
 
     def __init__(self) -> None:
         self.execute_calls: list[tuple[str, str, Optional[int]]] = []
@@ -83,12 +115,7 @@ class _StatelessFakeBackend(BaseNoSessionBackend):
 
 @pytest.fixture
 async def sweep_trigger() -> AsyncIterator[Event]:
-    """Patch session_manager.sleep with an Event-gated wait_for_event so
-    tests can drive the sweeper loop one tick at a time.
-
-    Mirrors the canonical pattern in
-    ``tests/unit/server/daemons/test_generative_model_store.py``.
-    """
+    """Patch ``session_manager.sleep`` so tests can drive the sweeper loop."""
     event = Event()
 
     async def wait_for_event(seconds: float) -> None:
@@ -100,9 +127,9 @@ async def sweep_trigger() -> AsyncIterator[Event]:
 
 
 @pytest.mark.asyncio
-async def test_acquire_populates_session_on_first_acquire_and_reuses() -> None:
-    """First acquire calls backend.start_session; second acquire of the same
-    key reuses — start_session called exactly once across two acquires."""
+async def test_acquire_invokes_find_or_create_session_once_per_key() -> None:
+    """First acquire calls ``find_or_create_session``; second acquire of the
+    same key reuses — ``find_or_create_session`` called exactly once."""
     manager = SandboxSessionManager()
     backend = _FakeBackend()
 
@@ -113,14 +140,16 @@ async def test_acquire_populates_session_on_first_acquire_and_reuses() -> None:
     async with manager.acquire(backend, "k1") as session:
         await session.execute("print(2)")
 
-    assert backend.start_calls == ["k1"], "start_session must be called exactly once"
-    assert len(backend.execute_calls) == 2
+    assert backend.find_calls == ["k1"], (
+        f"find_or_create_session must run once for k1; got {backend.find_calls!r}"
+    )
+    assert len(backend.execute_in_session_calls) == 2
+    # Both executes routed through the same handle bound to k1.
+    assert all(call[0] == "k1" for call in backend.execute_in_session_calls)
 
 
 @pytest.mark.asyncio
-async def test_idle_ttl_evicts_when_inflight_zero(sweep_trigger: Event) -> None:
-    """Idle TTL with in_flight_count==0 → sweep evicts and calls
-    backend.stop_session."""
+async def test_idle_ttl_evicts_via_close_session(sweep_trigger: Event) -> None:
     manager = SandboxSessionManager(
         idle_ttl_seconds=0.0,
         sweep_interval_seconds=0.0,
@@ -133,20 +162,17 @@ async def test_idle_ttl_evicts_when_inflight_zero(sweep_trigger: Event) -> None:
     await manager.start()
     try:
         await asyncio.sleep(0)
-        # Wait briefly so monotonic() advances past last_used + ttl (0.0).
         await asyncio.sleep(0.01)
-        # Trigger one sweep tick — sleep() is patched to wait on this Event.
         sweep_trigger.set()
-        # Yield to let the sweeper loop process. Poll for stop_session call.
         for _ in range(50):
             await asyncio.sleep(0.01)
-            if backend.stop_calls:
+            if backend.close_calls:
                 break
     finally:
         await manager.stop()
 
-    assert backend.stop_calls == ["k1"], (
-        f"sweeper must stop idle session; got stop_calls={backend.stop_calls}"
+    assert backend.close_calls == ["k1"], (
+        f"sweeper must close idle session; got close_calls={backend.close_calls}"
     )
 
 
@@ -154,7 +180,6 @@ async def test_idle_ttl_evicts_when_inflight_zero(sweep_trigger: Event) -> None:
 async def test_idle_ttl_does_not_evict_when_inflight_nonzero(
     sweep_trigger: Event,
 ) -> None:
-    """Idle TTL with in_flight_count>0 → sweep skips; stop_session not called."""
     manager = SandboxSessionManager(
         idle_ttl_seconds=0.0,
         sweep_interval_seconds=0.0,
@@ -164,15 +189,11 @@ async def test_idle_ttl_does_not_evict_when_inflight_nonzero(
     await manager.start()
     try:
         async with manager.acquire(backend, "k1"):
-            # Inside the acquire context the in-flight count is nonzero.
             sweep_trigger.set()
-            # Give the sweeper time to actually attempt a sweep.
             for _ in range(20):
                 await asyncio.sleep(0.01)
-        # Now we are outside the acquire context — but assertion is about
-        # the state during the sweep.
-        assert backend.stop_calls == [], (
-            f"sweeper must NOT stop in-flight session; got stop_calls={backend.stop_calls}"
+        assert backend.close_calls == [], (
+            f"sweeper must NOT close in-flight session; got {backend.close_calls}"
         )
     finally:
         await manager.stop()
@@ -180,9 +201,9 @@ async def test_idle_ttl_does_not_evict_when_inflight_nonzero(
 
 @pytest.mark.asyncio
 async def test_acquire_raises_session_limit_exceeded() -> None:
-    """At max_sessions_per_backend, a new acquire raises SessionLimitExceeded
-    and the manager remains usable for existing keys."""
-    manager = SandboxSessionManager(max_sessions_per_backend=2)
+    """At ``max_sessions_per_provider``, a new acquire for the same family
+    raises ``SessionLimitExceeded``; existing keys remain usable."""
+    manager = SandboxSessionManager(max_sessions_per_provider=2)
     backend = _FakeBackend()
 
     async with manager.acquire(backend, "k1"):
@@ -191,39 +212,72 @@ async def test_acquire_raises_session_limit_exceeded() -> None:
                 async with manager.acquire(backend, "k3"):
                     pytest.fail("acquire should have raised before entering body")
 
-            # Existing keys are still usable.
             async with manager.acquire(backend, "k1") as session:
                 await session.execute("print('still works')")
 
-    # start_session called once each for k1 and k2; k3 never reached start.
-    assert sorted(backend.start_calls) == ["k1", "k2"]
+    assert sorted(backend.find_calls) == ["k1", "k2"]
+
+
+@pytest.mark.asyncio
+async def test_capacity_is_per_provider_family() -> None:
+    """``max_sessions_per_provider`` counts entries per adapter family, not
+    per wrapper instance."""
+
+    class _BackendA(_FakeBackend):
+        family = "FAMILY_A"
+
+    class _BackendB(_FakeBackend):
+        family = "FAMILY_B"
+
+    manager = SandboxSessionManager(max_sessions_per_provider=1)
+    backend_a1 = _BackendA()
+    backend_a2 = _BackendA()  # same family, different wrapper instance
+    backend_b = _BackendB()
+
+    async with manager.acquire(backend_a1, "a1"):
+        # Same family ceiling reached — even a fresh wrapper for the same
+        # family must hit the cap.
+        with pytest.raises(SessionLimitExceeded):
+            async with manager.acquire(backend_a2, "a2"):
+                pytest.fail("FAMILY_A should be at capacity")
+        # Different family has its own budget.
+        async with manager.acquire(backend_b, "b1") as session:
+            await session.execute("ok")
+
+    assert backend_a1.find_calls == ["a1"]
+    assert backend_a2.find_calls == []
+    assert backend_b.find_calls == ["b1"]
 
 
 @pytest.mark.asyncio
 async def test_concurrent_acquires_respect_capacity_under_race() -> None:
-    """Regression: concurrent acquires for *different* keys on the same
-    backend can't both pass the capacity check.
-
-    Per-key locks alone don't serialize capacity accounting — two different
-    keys hold different per-key locks and can both yield on
-    ``backend.start_session`` before either inserts into ``_tracked``. The
-    check + reservation must run under ``_state_lock`` so the second acquire
-    sees the first's reservation immediately.
-    """
-    a_in_start = asyncio.Event()
+    """Two acquires for different keys on the same family can't both pass
+    the capacity check; the second must see the first's reservation."""
+    a_in_find = asyncio.Event()
     release_a = asyncio.Event()
 
     class _GatedBackend(SandboxBackend):
+        family = "GATED"
+
         def __init__(self) -> None:
-            self.start_calls: list[str] = []
+            self.find_calls: list[str] = []
 
-        async def start_session(self, session_key: str) -> None:
-            self.start_calls.append(session_key)
+        async def find_or_create_session(self, session_key: str) -> object:
+            self.find_calls.append(session_key)
             if session_key == "a":
-                a_in_start.set()
+                a_in_find.set()
                 await release_a.wait()
+            return _FakeHandle(session_key)
 
-        async def stop_session(self, session_key: str) -> None:
+        async def execute_in_session(
+            self,
+            handle: object,
+            code: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout="", stderr="")
+
+        async def close_session(self, session_key: str) -> None:
             pass
 
         async def execute(
@@ -238,7 +292,7 @@ async def test_concurrent_acquires_respect_capacity_under_race() -> None:
             pass
 
     backend = _GatedBackend()
-    manager = SandboxSessionManager(max_sessions_per_backend=1)
+    manager = SandboxSessionManager(max_sessions_per_provider=1)
 
     async def acquire_key(key: str) -> str:
         try:
@@ -247,16 +301,9 @@ async def test_concurrent_acquires_respect_capacity_under_race() -> None:
         except SessionLimitExceeded:
             return "rejected"
 
-    # Task A enters acquire and parks inside backend.start_session("a")
-    # AFTER reserving the slot under _state_lock.
     task_a = asyncio.create_task(acquire_key("a"))
-    await a_in_start.wait()
+    await a_in_find.wait()
 
-    # Task B attempts to acquire a different key on the same backend. With
-    # the fix it must see A's reservation under _state_lock and be rejected
-    # before ever calling backend.start_session("b"). Without the fix, B
-    # would pass the capacity check (because A hasn't inserted yet under the
-    # old code's logic) and proceed to start_session, exceeding the limit.
     task_b = asyncio.create_task(acquire_key("b"))
     result_b = await task_b
 
@@ -265,29 +312,38 @@ async def test_concurrent_acquires_respect_capacity_under_race() -> None:
 
     assert result_a == "acquired"
     assert result_b == "rejected"
-    # The fix is observable here: start_session must never be called for "b".
-    assert backend.start_calls == ["a"]
+    # find_or_create_session must never run for "b".
+    assert backend.find_calls == ["a"]
 
 
 @pytest.mark.asyncio
-async def test_start_session_failure_releases_reservation() -> None:
-    """If ``backend.start_session`` raises, the reserved slot must be popped
-    so the next acquire on the same key starts cleanly and capacity
-    accounting stays correct.
-    """
+async def test_find_or_create_session_failure_releases_reservation() -> None:
+    """If ``find_or_create_session`` raises, the reserved slot is popped so
+    the next acquire on the same key starts cleanly."""
 
     class _FailingBackend(SandboxBackend):
+        family = "FAILING"
+
         def __init__(self) -> None:
-            self.start_calls: list[str] = []
+            self.find_calls: list[str] = []
             self.fail_next = True
 
-        async def start_session(self, session_key: str) -> None:
-            self.start_calls.append(session_key)
+        async def find_or_create_session(self, session_key: str) -> object:
+            self.find_calls.append(session_key)
             if self.fail_next:
                 self.fail_next = False
-                raise RuntimeError("simulated start failure")
+                raise RuntimeError("simulated find_or_create failure")
+            return _FakeHandle(session_key)
 
-        async def stop_session(self, session_key: str) -> None:
+        async def execute_in_session(
+            self,
+            handle: object,
+            code: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout=code, stderr="")
+
+        async def close_session(self, session_key: str) -> None:
             pass
 
         async def execute(
@@ -302,139 +358,102 @@ async def test_start_session_failure_releases_reservation() -> None:
             pass
 
     backend = _FailingBackend()
-    manager = SandboxSessionManager(max_sessions_per_backend=1)
+    manager = SandboxSessionManager(max_sessions_per_provider=1)
 
-    with pytest.raises(RuntimeError, match="simulated start failure"):
+    with pytest.raises(RuntimeError, match="simulated find_or_create failure"):
         async with manager.acquire(backend, "k1"):
-            pytest.fail("acquire body should not run when start_session fails")
+            pytest.fail("body should not run when find_or_create_session fails")
 
-    # Reservation must have been rolled back — _tracked is empty, so the
-    # capacity slot is free and a fresh acquire starts a new session.
+    # Reservation rolled back: both dicts cleared.
     assert manager._tracked == {}
-    # D3's rollback-path lock pop: _key_locks entry must also be cleared
-    # so a failure storm doesn't slow-leak lock entries.
     assert manager._key_locks == {}
 
     async with manager.acquire(backend, "k1") as session:
         result = await session.execute("print('ok')")
     assert result.stdout == "print('ok')"
-    assert backend.start_calls == ["k1", "k1"]
+    assert backend.find_calls == ["k1", "k1"]
 
 
 @pytest.mark.asyncio
 async def test_key_locks_no_unbounded_growth_across_acquire_evict_cycles() -> None:
-    """D3 regression: ``_key_locks`` entries must be popped alongside
-    ``_tracked`` entries on every eviction site. Without the pop, the dict
-    grows unboundedly across the process lifetime because the frontend mints
-    a fresh UUID per component mount.
-
-    Drives 100 acquire/evict/acquire cycles on distinct keys and asserts
-    ``len(_key_locks) <= 1`` — zero or one residual entry from the last
-    iteration, never N.
-    """
-    manager = SandboxSessionManager(max_sessions_per_backend=4)
+    """``_key_locks`` entries must pop alongside ``_tracked`` on every
+    eviction site."""
+    manager = SandboxSessionManager(max_sessions_per_provider=4)
     backend = _FakeBackend()
 
     for i in range(100):
         key = f"k{i}"
         async with manager.acquire(backend, key):
             pass
-        await manager.evict_for_backend_key(backend, key)
+        await manager.evict_for_session_key(key)
 
     assert len(manager._key_locks) <= 1, (
-        f"_key_locks should not grow unboundedly; got {len(manager._key_locks)} entries"
+        f"_key_locks should not grow unboundedly; got {len(manager._key_locks)}"
     )
     assert len(manager._tracked) <= 1, (
-        f"_tracked should not grow unboundedly; got {len(manager._tracked)} entries"
+        f"_tracked should not grow unboundedly; got {len(manager._tracked)}"
     )
 
 
 @pytest.mark.asyncio
 async def test_release_after_lock_pop_still_decrements_inflight() -> None:
-    """D1 regression: a coroutine that captured the per-key lock reference
-    before a concurrent eviction popped ``_key_locks[key]`` must still
-    decrement ``in_flight_count`` correctly on release.
-
-    Drives the race: coroutine X acquires k1, exits cleanly. Then evict
-    pops both ``_tracked`` and ``_key_locks`` for k1. Coroutine Y was
-    waiting on the same per-key lock object across the pop. With the old
-    ``_release(key)`` signature, Y's release would do
-    ``self._key_locks.get(key)`` → None → return early, leaking the
-    in-flight count. With the D1 fix (``_release(key, key_lock)`` threaded
-    through), Y's release uses its captured lock reference and decrements
-    correctly.
-    """
-    manager = SandboxSessionManager(max_sessions_per_backend=2)
+    """A coroutine that captured the per-key lock before eviction popped
+    ``_key_locks`` must still decrement ``in_flight_count`` correctly on
+    release."""
+    manager = SandboxSessionManager(max_sessions_per_provider=2)
     backend = _FakeBackend()
 
-    # X acquires and exits cleanly. _tracked stays (no marked_for_eviction).
     async with manager.acquire(backend, "k1"):
         pass
 
-    # Capture X's per-key lock reference BEFORE eviction pops it.
-    key = (id(backend), "k1")
-    captured_lock = manager._key_locks[key]
+    captured_lock = manager._key_locks["k1"]
 
-    # Evict pops both _tracked[k1] and _key_locks[k1] (in_flight==0).
-    await manager.evict_for_backend_key(backend, "k1")
-    assert key not in manager._key_locks
-    assert key not in manager._tracked
-    assert backend.stop_calls == ["k1"]
+    await manager.evict_for_session_key("k1")
+    assert "k1" not in manager._key_locks
+    assert "k1" not in manager._tracked
+    assert backend.close_calls == ["k1"]
 
-    # Now Y enters acquire fresh — gets a NEW _key_locks entry. After Y's
-    # release, _tracked and _key_locks should be consistent (in_flight
-    # decremented, residual entries optional).
     async with manager.acquire(backend, "k1"):
-        # Inside Y's body the per-key lock entry is the fresh one, not
-        # captured_lock.
-        assert manager._key_locks[key] is not captured_lock
-        tracked = manager._tracked[key]
+        assert manager._key_locks["k1"] is not captured_lock
+        tracked = manager._tracked["k1"]
         assert tracked.in_flight_count == 1
-    # After Y's release, in_flight_count must be back to 0 — the release
-    # was through the new lock and the new tracked entry. _tracked still
-    # holds the entry (no eviction marker) with in_flight_count == 0.
-    assert manager._tracked[key].in_flight_count == 0
+    assert manager._tracked["k1"].in_flight_count == 0
 
 
 @pytest.mark.asyncio
-async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_start() -> None:
-    """D2 regression: two acquires for the same key racing across a popped
-    ``_key_locks`` entry must result in exactly one ``start_session`` call
-    AND the follower's body must not enter until the leader's start_session
-    has returned.
-
-    Sequence driven:
-    1. Leader X acquires k1, exits — release pops both dicts (marked for
-       eviction via evict_for_backend_key).
-    2. Y begins a new acquire for k1; gates inside ``backend.start_session``
-       on an Event so we can observe ordering.
-    3. Z begins a parallel acquire for k1 while Y is still parked in
-       start_session. Y is leader (is_new=True); Z is follower
-       (is_new=False) because Y inserted under _state_lock.
-    4. Assert Z does not enter its body before Y's start_session completes.
-    5. Release the gate; both complete.
-    6. Assert ``backend.start_calls.count("k1") == 1`` for the second-round
-       race (Y's start; Z reuses).
-    """
+async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_find() -> None:
+    """Two acquires for the same key racing across a popped ``_key_locks``
+    entry must result in exactly one ``find_or_create_session`` call AND the
+    follower's body must not enter until the leader's find resolves."""
 
     start_gate = asyncio.Event()
-    leader_in_start = asyncio.Event()
+    leader_in_find = asyncio.Event()
     follower_entered_body = asyncio.Event()
 
     class _GatedBackend(SandboxBackend):
+        family = "GATED_PARALLEL"
+
         def __init__(self) -> None:
-            self.start_calls: list[str] = []
-            self.stop_calls: list[str] = []
+            self.find_calls: list[str] = []
+            self.close_calls: list[str] = []
 
-        async def start_session(self, session_key: str) -> None:
-            self.start_calls.append(session_key)
-            if session_key == "k1" and len(self.start_calls) >= 2:
-                # Second start_session call (Y's) — park here.
-                leader_in_start.set()
+        async def find_or_create_session(self, session_key: str) -> object:
+            self.find_calls.append(session_key)
+            if session_key == "k1" and len(self.find_calls) >= 2:
+                leader_in_find.set()
                 await start_gate.wait()
+            return _FakeHandle(session_key)
 
-        async def stop_session(self, session_key: str) -> None:
-            self.stop_calls.append(session_key)
+        async def execute_in_session(
+            self,
+            handle: object,
+            code: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout=code, stderr="")
+
+        async def close_session(self, session_key: str) -> None:
+            self.close_calls.append(session_key)
 
         async def execute(
             self,
@@ -448,25 +467,21 @@ async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_sta
             pass
 
     backend = _GatedBackend()
-    manager = SandboxSessionManager(max_sessions_per_backend=4)
+    manager = SandboxSessionManager(max_sessions_per_provider=4)
 
-    # Step 1: X acquires and is then evicted; both dicts pop.
     async with manager.acquire(backend, "k1"):
         pass
-    await manager.evict_for_backend_key(backend, "k1")
-    key = (id(backend), "k1")
-    assert key not in manager._key_locks
-    assert key not in manager._tracked
+    await manager.evict_for_session_key("k1")
+    assert "k1" not in manager._key_locks
+    assert "k1" not in manager._tracked
 
-    # Step 2: Y begins acquire — leader. Will park in start_session.
     async def y_acquire() -> str:
         async with manager.acquire(backend, "k1"):
             return "y-acquired"
 
     task_y = asyncio.create_task(y_acquire())
-    await leader_in_start.wait()
+    await leader_in_find.wait()
 
-    # Step 3: Z begins acquire — follower. Should block on start_ready.
     async def z_acquire() -> str:
         async with manager.acquire(backend, "k1"):
             follower_entered_body.set()
@@ -474,33 +489,28 @@ async def test_same_key_parallel_acquires_under_popped_lock_waits_for_single_sta
 
     task_z = asyncio.create_task(z_acquire())
 
-    # Yield repeatedly to give Z a chance to advance — but assert it does
-    # NOT enter its body while Y is parked.
     for _ in range(20):
         await asyncio.sleep(0.01)
     assert not follower_entered_body.is_set(), (
-        "follower must NOT enter body before leader's start_session resolves"
+        "follower must NOT enter body before leader's find_or_create_session resolves"
     )
 
-    # Step 5: release gate; both should complete.
     start_gate.set()
     result_y = await task_y
     result_z = await task_z
     assert result_y == "y-acquired"
     assert result_z == "z-acquired"
 
-    # Step 6: Y's start_session was called exactly once for k1 in the
-    # second race round. Total starts: X's k1 + Y's k1 == 2.
-    assert backend.start_calls.count("k1") == 2, (
-        f"start_session must be called once for X and once for Y, never for Z; "
-        f"got start_calls={backend.start_calls}"
+    assert backend.find_calls.count("k1") == 2, (
+        f"find_or_create_session must run once for X and once for Y, never for Z; "
+        f"got find_calls={backend.find_calls}"
     )
 
 
 @pytest.mark.asyncio
 async def test_no_op_for_stateless_backend() -> None:
-    """BaseNoSessionBackend → acquire bypasses lock/state tracking entirely;
-    backend.execute is invoked, no entries are added to manager state."""
+    """``BaseNoSessionBackend`` short-circuits — acquire bypasses lock/state
+    tracking; ``execute_in_session`` routes to ``execute``."""
     manager = SandboxSessionManager()
     backend = _StatelessFakeBackend()
 
@@ -508,8 +518,8 @@ async def test_no_op_for_stateless_backend() -> None:
         result = await session.execute("print('hi')")
 
     assert result.stdout == "print('hi')"
-    assert backend.execute_calls == [("print('hi')", "k1", None)]
-    # Manager did not track any state for the stateless backend.
+    # BaseNoSessionBackend.execute_in_session delegates to execute with key="".
+    assert backend.execute_calls == [("print('hi')", "", None)]
     assert manager._tracked == {}
     assert manager._key_locks == {}
 
@@ -518,7 +528,6 @@ async def test_no_op_for_stateless_backend() -> None:
 async def test_daemontask_stop_cancels_sweeper_within_grace(
     sweep_trigger: Event,
 ) -> None:
-    """DaemonTask.stop() cancels the sweeper task; no dangling sessions."""
     manager = SandboxSessionManager(
         idle_ttl_seconds=60.0,
         sweep_interval_seconds=0.0,
@@ -526,36 +535,23 @@ async def test_daemontask_stop_cancels_sweeper_within_grace(
     backend = _FakeBackend()
 
     await manager.start()
-    # Run at least one sweep tick to confirm the sweeper is alive.
     sweep_trigger.set()
     await asyncio.sleep(0.01)
 
     async with manager.acquire(backend, "k1"):
-        pass  # session is tracked but not expired
+        pass
 
     await manager.stop()
-
-    # Sweeper task is fully done and cleared.
     assert manager._tasks == []
-    # Stop must complete within the DaemonTask 10s grace; if we got here we passed.
 
 
 @pytest.mark.asyncio
 async def test_acquire_raises_session_invalidated_when_marked_for_eviction() -> None:
-    """An existing tracked entry marked for eviction must refuse new admits.
-
-    Drives the race: a long-running acquire holds an in-flight session;
-    a concurrent ``evict_for_backend_key`` marks the entry for eviction
-    (cannot stop synchronously because in_flight > 0); a fresh acquire
-    on the same key must observe ``marked_for_eviction`` and raise
-    ``SessionInvalidated`` rather than piggy-backing onto the drained-out
-    entry.
-    """
     leader_in_body = asyncio.Event()
     release_leader = asyncio.Event()
 
     manager = SandboxSessionManager(
-        max_sessions_per_backend=4,
+        max_sessions_per_provider=4,
         eviction_grace_seconds=0.0,
     )
     backend = _FakeBackend()
@@ -568,12 +564,8 @@ async def test_acquire_raises_session_invalidated_when_marked_for_eviction() -> 
     leader = asyncio.create_task(long_acquire())
     await leader_in_body.wait()
 
-    # Mark the entry for eviction — in-flight > 0, so the entry stays
-    # tracked with marked_for_eviction=True and the eviction-grace poll
-    # returns immediately (grace=0.0).
-    await manager.evict_for_backend_key(backend, "k1")
+    await manager.evict_for_session_key("k1")
 
-    # Fresh acquire on the same key must refuse rather than admit.
     with pytest.raises(SessionInvalidated):
         async with manager.acquire(backend, "k1"):
             pytest.fail("acquire should refuse admit onto a marked entry")
@@ -581,17 +573,13 @@ async def test_acquire_raises_session_invalidated_when_marked_for_eviction() -> 
     release_leader.set()
     await leader
 
-    # start_session was called once (for the leader) and never re-driven
-    # for the rejected admit.
-    assert backend.start_calls == ["k1"]
+    assert backend.find_calls == ["k1"]
 
 
 @pytest.mark.asyncio
-async def test_manager_stop_drains_tracked_via_backend_stop_session() -> None:
-    """``SandboxSessionManager.stop`` must evict tracked entries before
-    cancelling the sweeper — backend.stop_session is called for every
-    tracked (backend, key) pair, then the sweeper task is gone.
-    """
+async def test_manager_stop_drains_tracked_via_close_session() -> None:
+    """``stop`` must drive ``close_session`` for every tracked key before
+    cancelling the sweeper."""
     manager = SandboxSessionManager(
         idle_ttl_seconds=60.0,
         sweep_interval_seconds=60.0,
@@ -611,37 +599,43 @@ async def test_manager_stop_drains_tracked_via_backend_stop_session() -> None:
     finally:
         await manager.stop()
 
-    assert sorted(backend_a.stop_calls) == ["ka1", "ka2"], (
-        f"backend_a.stop_session must be called for both keys; got {backend_a.stop_calls}"
-    )
-    assert backend_b.stop_calls == ["kb1"], (
-        f"backend_b.stop_session must be called for its key; got {backend_b.stop_calls}"
-    )
+    assert sorted(backend_a.close_calls) == ["ka1", "ka2"]
+    assert backend_b.close_calls == ["kb1"]
     assert manager._tasks == []
 
 
 @pytest.mark.asyncio
 async def test_manager_stop_awaits_pending_tasks_before_cancelling_sweeper() -> None:
     """``schedule_eviction`` tasks must be awaited (not cancelled) by
-    ``stop`` so the underlying ``backend.stop_session`` completes.
-    """
-    stop_session_entered = asyncio.Event()
-    release_stop = asyncio.Event()
-    stop_session_completed = asyncio.Event()
+    ``stop`` so the underlying ``close_session`` completes."""
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    close_completed = asyncio.Event()
 
-    class _SlowStopBackend(SandboxBackend):
+    class _SlowCloseBackend(SandboxBackend):
+        family = "SLOW_CLOSE"
+
         def __init__(self) -> None:
-            self.start_calls: list[str] = []
-            self.stop_calls: list[str] = []
+            self.find_calls: list[str] = []
+            self.close_calls: list[str] = []
 
-        async def start_session(self, session_key: str) -> None:
-            self.start_calls.append(session_key)
+        async def find_or_create_session(self, session_key: str) -> object:
+            self.find_calls.append(session_key)
+            return _FakeHandle(session_key)
 
-        async def stop_session(self, session_key: str) -> None:
-            stop_session_entered.set()
-            await release_stop.wait()
-            self.stop_calls.append(session_key)
-            stop_session_completed.set()
+        async def execute_in_session(
+            self,
+            handle: object,
+            code: str,
+            timeout: Optional[int] = None,
+        ) -> ExecutionResult:
+            return ExecutionResult(stdout="", stderr="")
+
+        async def close_session(self, session_key: str) -> None:
+            close_entered.set()
+            await release_close.wait()
+            self.close_calls.append(session_key)
+            close_completed.set()
 
         async def execute(
             self,
@@ -654,7 +648,7 @@ async def test_manager_stop_awaits_pending_tasks_before_cancelling_sweeper() -> 
         async def close(self) -> None:
             pass
 
-    backend = _SlowStopBackend()
+    backend = _SlowCloseBackend()
     manager = SandboxSessionManager(
         idle_ttl_seconds=60.0,
         sweep_interval_seconds=60.0,
@@ -665,53 +659,32 @@ async def test_manager_stop_awaits_pending_tasks_before_cancelling_sweeper() -> 
     async with manager.acquire(backend, "k1"):
         pass
 
-    # Fire-and-forget eviction parked inside backend.stop_session.
-    manager.schedule_eviction(backend, "k1")
-    await stop_session_entered.wait()
+    manager.schedule_eviction("k1")
+    await close_entered.wait()
 
     async def run_stop() -> None:
         await manager.stop()
 
     stop_task = asyncio.create_task(run_stop())
-    # Give stop() a chance to begin its drain; assert it has NOT cancelled
-    # the in-flight stop_session.
     await asyncio.sleep(0.05)
-    assert not stop_session_completed.is_set()
+    assert not close_completed.is_set()
 
-    # Release the in-flight stop_session; stop() must observe completion.
-    release_stop.set()
+    release_close.set()
     await stop_task
 
-    assert backend.stop_calls == ["k1"], (
-        f"backend.stop_session must complete before stop returns; got {backend.stop_calls}"
-    )
+    assert backend.close_calls == ["k1"]
 
 
 @pytest.mark.asyncio
 async def test_evict_drain_poll_identity_check_rejects_fresh_same_key_entry() -> None:
-    """The eviction drain-poll must identity-check the tracked entry —
-    a fresh same-key acquire after the marked entry drains and pops
-    must not be misread as the marked entry still in flight (or worse,
-    as having drained when it was actually a new admit).
-
-    Drives the race:
-    1. Acquire k1 — entry E1 inserted, in_flight=1.
-    2. evict_for_backend_key(k1) starts — E1 in_flight > 0 so it's
-       marked_for_eviction; evict enters its drain-poll loop.
-    3. Release E1 — _release pops E1 from _tracked and calls stop_session.
-    4. Schedule a fresh acquire on k1 — inserts a NEW entry E2.
-    5. Evict's drain-poll runs identity check: ``_tracked.get(key) is E1``
-       returns False (E2 is there), so E1 is correctly removed from
-       the wait set and the drain returns.
-
-    Observable: the evict call returns within the grace window AND
-    the fresh acquire does not raise (E2 is not marked_for_eviction).
-    """
+    """The drain-poll must identity-check the tracked entry so a fresh
+    same-key acquire that pops the marked entry and inserts a new one is
+    not misread."""
     in_first_body = asyncio.Event()
     release_first = asyncio.Event()
 
     manager = SandboxSessionManager(
-        max_sessions_per_backend=4,
+        max_sessions_per_provider=4,
         eviction_grace_seconds=1.0,
     )
     backend = _FakeBackend()
@@ -725,26 +698,67 @@ async def test_evict_drain_poll_identity_check_rejects_fresh_same_key_entry() ->
     await in_first_body.wait()
 
     async def evict() -> None:
-        await manager.evict_for_backend_key(backend, "k1")
+        await manager.evict_for_session_key("k1")
 
     evict_task = asyncio.create_task(evict())
-    # Yield so evict enters its drain-poll loop.
     await asyncio.sleep(0.02)
 
-    # Release first: _release pops E1 from _tracked and calls stop_session.
     release_first.set()
     await first
 
-    # Fresh acquire inserts a NEW entry on the same key. The identity check
-    # in the drain-poll must see this is NOT E1 (which was popped) and let
-    # the evict_task return.
     async with manager.acquire(backend, "k1") as session:
         result = await session.execute("print('post-evict')")
 
-    # Evict must have completed (drain-poll did not get stuck on the
-    # fresh entry mistakenly treated as the marked one).
     await asyncio.wait_for(evict_task, timeout=2.0)
 
     assert result.stdout == "print('post-evict')"
-    # backend.stop_session was called exactly once — for E1 on release.
-    assert backend.stop_calls == ["k1"]
+    assert backend.close_calls == ["k1"]
+
+
+@pytest.mark.asyncio
+async def test_evict_for_provider_family_targets_only_matching_family() -> None:
+    """``evict_for_provider_family`` marks/closes only entries whose
+    ``family`` matches; other families are untouched."""
+
+    class _BackendModal(_FakeBackend):
+        family = "MODAL"
+
+    class _BackendE2B(_FakeBackend):
+        family = "E2B"
+
+    manager = SandboxSessionManager(max_sessions_per_provider=8)
+    modal_a = _BackendModal()
+    modal_b = _BackendModal()
+    e2b = _BackendE2B()
+
+    async with manager.acquire(modal_a, "m1"):
+        pass
+    async with manager.acquire(modal_b, "m2"):
+        pass
+    async with manager.acquire(e2b, "e1"):
+        pass
+
+    await manager.evict_for_provider_family("MODAL")
+
+    assert sorted(modal_a.close_calls) == ["m1"]
+    assert sorted(modal_b.close_calls) == ["m2"]
+    assert e2b.close_calls == []
+    assert "e1" in manager._tracked
+
+
+@pytest.mark.asyncio
+async def test_execute_routes_through_execute_in_session_with_bound_handle() -> None:
+    """``session.execute`` must call ``backend.execute_in_session(handle, ...)``
+    with the handle stored on the tracked entry — NOT ``backend.execute``."""
+    manager = SandboxSessionManager()
+    backend = _FakeBackend()
+
+    async with manager.acquire(backend, "k1") as session:
+        await session.execute("print(1)", timeout=42)
+        await session.execute("print(2)")
+
+    # Both executes ran via execute_in_session against the same handle.
+    assert [c[0] for c in backend.execute_in_session_calls] == ["k1", "k1"]
+    assert [c[1] for c in backend.execute_in_session_calls] == ["print(1)", "print(2)"]
+    assert backend.execute_in_session_calls[0][2] == 42
+    assert backend.execute_in_session_calls[1][2] is None

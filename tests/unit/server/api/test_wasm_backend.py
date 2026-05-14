@@ -28,15 +28,21 @@ from phoenix.server.sandbox.wasm_backend import (  # noqa: E402
 
 
 class TestWASMBackendSessionNoop:
-    """WASMBackend inherits BaseNoSessionBackend — start/stop are no-ops."""
+    """WASMBackend inherits BaseNoSessionBackend — find_or_create_session
+    returns a sentinel, close_session is a no-op, and execute_in_session
+    routes through execute()."""
 
-    async def test_start_session_does_not_raise(self) -> None:
+    async def test_find_or_create_session_returns_sentinel(self) -> None:
         backend = WASMBackend(binary_path=Path("/nonexistent"))
-        await backend.start_session("any-key")
+        handle = await backend.find_or_create_session("any-key")
+        # Same sentinel object across calls (BaseNoSessionBackend returns the
+        # module-level singleton).
+        again = await backend.find_or_create_session("other-key")
+        assert handle is again
 
-    async def test_stop_session_does_not_raise(self) -> None:
+    async def test_close_session_does_not_raise(self) -> None:
         backend = WASMBackend(binary_path=Path("/nonexistent"))
-        await backend.stop_session("any-key")
+        await backend.close_session("any-key")
 
     async def test_close_does_not_raise(self) -> None:
         backend = WASMBackend(binary_path=Path("/nonexistent"))

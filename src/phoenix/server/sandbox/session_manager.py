@@ -14,6 +14,16 @@ process). Application code obtains the instance via
 ``info.context.sandbox_session_manager`` (GraphQL) or
 ``request.app.state.sandbox_session_manager`` (FastAPI) — never by
 constructing a new manager.
+
+Keying model: ``_tracked`` and ``_key_locks`` are keyed on the opaque
+``session_key`` string supplied by the caller. Backend wrappers are
+ephemeral (every request constructs a fresh ``SandboxBackend`` via
+``build_sandbox_backend``); wrapper identity is not load-bearing for
+session dispatch. Sessions are bound at the provider via
+``backend.find_or_create_session(session_key)``, which returns an opaque
+remote handle that the manager retains on ``_TrackedSession`` and passes
+back to ``backend.execute_in_session(handle, code, timeout=...)`` on
+each execute.
 """
 
 from __future__ import annotations
@@ -25,7 +35,7 @@ from asyncio import Event, Lock, Task, sleep
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import AsyncIterator, Callable, Optional
+from typing import AsyncIterator, Optional
 
 from phoenix.server.sandbox.types import (
     BaseNoSessionBackend,
@@ -40,7 +50,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_IDLE_TTL_SECONDS = 300.0
 _DEFAULT_SWEEP_INTERVAL_SECONDS = 30.0
 _DEFAULT_EVICTION_GRACE_SECONDS = 5.0
-_DEFAULT_MAX_SESSIONS_PER_BACKEND = 32
+_DEFAULT_MAX_SESSIONS_PER_PROVIDER = 32
 
 
 def _env_float(name: str, default: float) -> float:
@@ -65,15 +75,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _family_of(backend: SandboxBackend) -> str:
+    # Falls back to ``type(backend).__name__`` because ``SandboxBackend``
+    # wrappers do not carry a ``family`` attribute today; ``SandboxAdapter.family``
+    # lives on the factory class. Aligning the namespaces is deferred — adding
+    # ``family = "MODAL"`` etc. to each backend wrapper class is a one-line
+    # change that this ``getattr`` picks up automatically when it happens.
+    return getattr(backend, "family", type(backend).__name__)
+
+
 class SessionLimitExceeded(Exception):
-    """Raised by ``SandboxSessionManager.acquire`` when a backend has reached
-    ``max_sessions_per_backend``.
+    """Raised by ``SandboxSessionManager.acquire`` when a provider family has
+    reached ``max_sessions_per_provider``.
 
     Capacity refusal — not a backend execution failure. Raised BEFORE
-    ``backend.start_session`` is called, and the manager's internal state
-    is unchanged when the exception propagates. ``CodeEvaluatorRunner``
-    converts this to an ``ExecutionResult`` with a stable error code so
-    the UI sees a deterministic, user-actionable message.
+    ``backend.find_or_create_session`` is called, and the manager's internal
+    state is unchanged when the exception propagates. ``CodeEvaluatorRunner``
+    converts this to an ``ExecutionResult`` with a stable error code so the
+    UI sees a deterministic, user-actionable message.
     """
 
     MESSAGE = "session_limit_exceeded"
@@ -88,11 +107,12 @@ class SessionInvalidated(Exception):
 
     Admit-block refusal — the existing entry is draining and will be stopped
     once in-flight users release. New admits must not extend its lifetime
-    past the explicit stop request. Raised BEFORE ``backend.start_session``
-    is called; the manager's internal state is unchanged when the exception
-    propagates. ``CodeEvaluatorRunner`` converts this to an
-    ``ExecutionResult`` with a stable error code so the UI sees a
-    deterministic, user-actionable message rather than a silent restart.
+    past the explicit stop request. Raised BEFORE
+    ``backend.find_or_create_session`` is called; the manager's internal
+    state is unchanged when the exception propagates. ``CodeEvaluatorRunner``
+    converts this to an ``ExecutionResult`` with a stable error code so the
+    UI sees a deterministic, user-actionable message rather than a silent
+    restart.
     """
 
     MESSAGE = "session_invalidated"
@@ -105,15 +125,21 @@ class SessionInvalidated(Exception):
 class _TrackedSession:
     backend: SandboxBackend
     session_key: str
+    family: str
+    # Opaque remote handle returned by ``backend.find_or_create_session``.
+    # Manager passes this back to ``backend.execute_in_session`` on each
+    # execute; the manager treats it as opaque. ``None`` between reservation
+    # and the leader's first successful find_or_create_session.
+    handle: object = None
     in_flight_count: int = 0
     last_used: float = field(default_factory=monotonic)
     marked_for_eviction: bool = False
     # Startup-readiness gate: the leader (is_new=True acquire) flips
-    # ``start_ready`` after ``backend.start_session`` resolves so concurrent
-    # followers waiting on the same key block from crossing the in_flight
-    # boundary until the backend session actually exists. On failure the
-    # leader records the exception in ``start_error`` and signals readiness
-    # so followers wake and re-raise the same error.
+    # ``start_ready`` after ``backend.find_or_create_session`` resolves so
+    # concurrent followers waiting on the same key block from crossing the
+    # in_flight boundary until the remote session actually exists. On failure
+    # the leader records the exception in ``start_error`` and signals
+    # readiness so followers wake and re-raise the same error.
     start_ready: Event = field(default_factory=Event)
     start_error: Optional[BaseException] = None
 
@@ -121,18 +147,21 @@ class _TrackedSession:
 class SandboxSession:
     """Handle returned by ``SandboxSessionManager.acquire``.
 
-    Calls ``backend.execute(code, session_key, timeout=timeout)`` directly;
-    in-flight ref-counting and last-used tracking are handled by the manager
-    around the ``async with`` boundary.
+    Calls ``backend.execute_in_session(handle, code, timeout=timeout)``
+    against the remote handle the manager bound at acquire time. In-flight
+    ref-counting and last-used tracking are handled by the manager around
+    the ``async with`` boundary.
     """
 
     def __init__(
         self,
         backend: SandboxBackend,
         session_key: str,
+        handle: object,
     ) -> None:
         self._backend = backend
         self._session_key = session_key
+        self._handle = handle
 
     @property
     def session_key(self) -> str:
@@ -143,7 +172,7 @@ class SandboxSession:
         code: str,
         timeout: Optional[int] = None,
     ) -> ExecutionResult:
-        return await self._backend.execute(code, self._session_key, timeout=timeout)
+        return await self._backend.execute_in_session(self._handle, code, timeout=timeout)
 
 
 class SandboxSessionManager(DaemonTask):
@@ -151,44 +180,53 @@ class SandboxSessionManager(DaemonTask):
 
     - ``acquire(backend, session_key)`` — async context manager. Starts (or
       reuses) a session and yields a ``SandboxSession``. Enforces
-      ``max_sessions_per_backend`` before invoking ``backend.start_session``.
-      Refuses admits onto entries marked for eviction by raising
-      ``SessionInvalidated``.
-    - ``evict_for_backend(backend)`` / ``evict_for_backend_type(type)`` /
-      ``evict_for_backend_key(backend, key)`` — invalidation API. Stops
-      backend sessions whose in-flight count is zero immediately; marks
-      in-use sessions for stop-on-release.
-    - ``schedule_eviction(backend, session_key)`` — fire-and-forget API for
-      callers that cannot ``await`` the eviction inline (notably the
-      per-execute timeout teardown in ``CodeEvaluatorRunner``, which runs
-      in both GraphQL request and ``ExperimentRunner`` daemon scopes). The
-      created task is retained on the manager so shutdown awaits it.
+      ``max_sessions_per_provider`` (counted by adapter family) before
+      invoking ``backend.find_or_create_session``. Refuses admits onto
+      entries marked for eviction by raising ``SessionInvalidated``.
+    - ``evict_for_session_key(session_key)`` — invalidation by opaque
+      session_key. Sessions with ``in_flight_count == 0`` are closed
+      immediately; in-use sessions are marked for stop-on-release.
+    - ``evict_for_provider_family(family)`` — scans ``_tracked`` and marks
+      every entry whose ``family`` matches.
+    - ``schedule_eviction(session_key)`` — fire-and-forget API for callers
+      that cannot ``await`` the eviction inline (notably the per-execute
+      timeout teardown in ``CodeEvaluatorRunner``, which runs in both
+      GraphQL request and ``ExperimentRunner`` daemon scopes). The created
+      task is retained on the manager so shutdown awaits it.
     - Background sweeper (``_run``) evicts entries whose ``last_used``
       crosses the idle TTL with ``in_flight_count == 0``.
 
     Stateless backends (``BaseNoSessionBackend``) bypass all locking and
     state tracking — ``acquire`` returns a handle wired directly to
-    ``backend.execute``.
+    ``backend.execute_in_session`` (which itself delegates to
+    ``backend.execute``).
 
     **Lock-order invariant.** Two locks coexist: a single ``_state_lock``
     that guards the ``_tracked`` / ``_key_locks`` dicts, and one
-    ``asyncio.Lock`` per ``(backend_id, session_key)`` in ``_key_locks``.
-    ``acquire`` takes the per-key lock OUTER and ``_state_lock`` INNER
-    (existence check, capacity check, and reservation insertion all run
-    under ``_state_lock`` so a fresh same-key acquire sees a leader's
-    reservation immediately). ``evict_for_backend*`` and ``_sweep_idle``
-    take ``_state_lock`` only long enough to snapshot the target keys,
-    then release it before acquiring each per-key lock — holding both
-    locks across an ``await`` on ``backend.stop_session`` would deadlock
-    against an in-flight acquire on the same key.
+    ``asyncio.Lock`` per ``session_key`` in ``_key_locks``. ``acquire``
+    takes the per-key lock OUTER and ``_state_lock`` INNER (existence
+    check, capacity check, and reservation insertion all run under
+    ``_state_lock`` so a fresh same-key acquire sees a leader's reservation
+    immediately). Eviction paths take ``_state_lock`` only long enough to
+    snapshot the target keys, then release it before acquiring each
+    per-key lock — holding both locks across an ``await`` on
+    ``backend.close_session`` would deadlock against an in-flight acquire
+    on the same key.
+
+    **Pop-before-await invariant.** The manager releases its per-key lock
+    BEFORE awaiting ``backend.close_session`` (see ``_release``,
+    ``_evict_targets``, and ``_sweep_idle``). Adapters are required to pop
+    their backend-local bookkeeping (e.g. a ``_sessions[session_key]``
+    map) synchronously before their first ``await`` so a concurrent
+    same-key ``find_or_create_session`` cannot race the close.
 
     **Shutdown ordering.** ``stop()`` (overridden from ``DaemonTask``)
     drains in three phases under the inherited 10s ceiling:
     (1) await ``_pending_tasks`` (fire-and-forget evictions from
     ``schedule_eviction``) under ``wait_for(eviction_grace_seconds)`` so
-    their underlying ``stop_session`` calls complete rather than being
-    cancelled mid-flight; (2) snapshot unique backends from ``_tracked``
-    and call ``evict_for_backend`` on each (marks in-flight entries and
+    their underlying ``close_session`` calls complete rather than being
+    cancelled mid-flight; (2) snapshot every tracked session_key and
+    drain via ``_evict_targets`` (which marks in-flight entries and
     waits up to ``eviction_grace_seconds`` for them to drain);
     (3) ``super().stop()`` cancels the sweeper. ``_pending_tasks`` is a
     set held adjacent to (not merged into) the inherited ``self._tasks``:
@@ -204,7 +242,7 @@ class SandboxSessionManager(DaemonTask):
         idle_ttl_seconds: Optional[float] = None,
         sweep_interval_seconds: Optional[float] = None,
         eviction_grace_seconds: Optional[float] = None,
-        max_sessions_per_backend: Optional[int] = None,
+        max_sessions_per_provider: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._idle_ttl_seconds: float = (
@@ -231,32 +269,32 @@ class SandboxSessionManager(DaemonTask):
                 _DEFAULT_EVICTION_GRACE_SECONDS,
             )
         )
-        self._max_sessions_per_backend: int = (
-            max_sessions_per_backend
-            if max_sessions_per_backend is not None
+        self._max_sessions_per_provider: int = (
+            max_sessions_per_provider
+            if max_sessions_per_provider is not None
             else _env_int(
-                "PHOENIX_SANDBOX_MAX_SESSIONS_PER_BACKEND",
-                _DEFAULT_MAX_SESSIONS_PER_BACKEND,
+                "PHOENIX_SANDBOX_MAX_SESSIONS_PER_PROVIDER",
+                _DEFAULT_MAX_SESSIONS_PER_PROVIDER,
             )
         )
 
         # asyncio primitives are loop-bound; construct lazily inside the
         # running loop (start() / acquire()) rather than at __init__ time.
         self._state_lock: Optional[Lock] = None
-        self._key_locks: dict[tuple[int, str], Lock] = {}
-        self._tracked: dict[tuple[int, str], _TrackedSession] = {}
+        self._key_locks: dict[str, Lock] = {}
+        self._tracked: dict[str, _TrackedSession] = {}
         # Fire-and-forget eviction tasks scheduled via schedule_eviction.
         # Held adjacent to (not merged into) self._tasks: self._tasks is the
         # daemon body spawned from _run() and is cancelled by DaemonTask.stop;
         # _pending_tasks is awaited (not cancelled) on stop so the underlying
-        # backend.stop_session completes rather than being cancelled mid-flight.
+        # backend.close_session completes rather than being cancelled mid-flight.
         self._pending_tasks: Optional[set[Task[None]]] = None
 
     @property
     def eviction_grace_seconds(self) -> float:
-        """Maximum time ``evict_for_backend*`` waits for in-flight sessions to
-        drain before returning. Settable to compress shutdown / invalidation
-        timing in tests."""
+        """Maximum time eviction paths wait for in-flight sessions to drain
+        before returning. Settable to compress shutdown / invalidation timing
+        in tests."""
         return self._eviction_grace_seconds
 
     @eviction_grace_seconds.setter
@@ -273,23 +311,27 @@ class SandboxSessionManager(DaemonTask):
         backend: SandboxBackend,
         session_key: str,
     ) -> AsyncIterator[SandboxSession]:
-        """Yield a ``SandboxSession`` bound to (backend, session_key).
+        """Yield a ``SandboxSession`` bound to ``session_key``.
 
-        For session-capable backends: ensures the session is started under
-        a per-key lock, increments in-flight count on enter, decrements on
-        exit, and fires ``backend.stop_session`` on exit if the session was
+        For session-capable backends: ensures the session is bound under a
+        per-key lock (leader calls ``backend.find_or_create_session`` and
+        stores the returned handle on ``_TrackedSession``; followers reuse
+        the same handle), increments in-flight count on enter, decrements on
+        exit, and fires ``backend.close_session`` on exit if the session was
         marked for eviction and in-flight reaches zero.
 
         For ``BaseNoSessionBackend`` backends: short-circuits — no locking,
-        no state tracking, no eviction.
+        no state tracking, no eviction. The sentinel handle from
+        ``find_or_create_session`` is passed through to
+        ``execute_in_session`` (which itself delegates to ``execute``).
         """
         if isinstance(backend, BaseNoSessionBackend):
-            yield SandboxSession(backend, session_key)
+            sentinel = await backend.find_or_create_session(session_key)
+            yield SandboxSession(backend, session_key, sentinel)
             return
 
-        key = (id(backend), session_key)
         await self._ensure_state_lock()
-        key_lock = await self._get_or_create_key_lock(key)
+        key_lock = await self._get_or_create_key_lock(session_key)
 
         async with key_lock:
             # Existence + capacity + insertion are atomic under
@@ -299,96 +341,82 @@ class SandboxSessionManager(DaemonTask):
             # dedup. Folding the existence check into the capacity-check +
             # insertion critical section makes ``_state_lock`` the inner
             # authority and closes the duplicate-start gap.
-            tracked, is_new = await self._get_or_reserve(backend, key, session_key)
+            tracked, is_new = await self._get_or_reserve(backend, session_key)
             if is_new:
                 try:
-                    await backend.start_session(session_key)
+                    handle = await backend.find_or_create_session(session_key)
                 except BaseException as exc:
-                    # start_session failed: drop the reservation so capacity
-                    # accounting stays correct, then wake any followers
-                    # waiting on the readiness gate so they observe the
-                    # error and re-raise. ``_key_locks`` is popped here too
-                    # so a failure storm doesn't slow-leak lock entries —
+                    # find_or_create_session failed: drop the reservation so
+                    # capacity accounting stays correct, then wake any
+                    # followers waiting on the readiness gate so they observe
+                    # the error and re-raise. ``_key_locks`` is popped here
+                    # too so a failure storm doesn't slow-leak lock entries —
                     # safe because no other coroutine can be parked on
                     # ``key_lock`` while this acquire holds it.
                     tracked.start_error = exc
                     assert self._state_lock is not None
                     async with self._state_lock:
-                        self._tracked.pop(key, None)
-                        self._key_locks.pop(key, None)
+                        self._tracked.pop(session_key, None)
+                        self._key_locks.pop(session_key, None)
                     tracked.start_ready.set()
                     raise
+                tracked.handle = handle
                 tracked.start_ready.set()
 
             # All acquires (leader and follower) wait for startup to settle
             # before crossing the in_flight boundary. The leader sets
             # ``start_ready`` immediately above; a follower may park here
-            # and wake only after the leader's start_session resolves. If
-            # startup failed, propagate the leader's exception so the
-            # follower doesn't yield a SandboxSession against a backend
-            # session that does not exist.
+            # and wake only after the leader's find_or_create_session
+            # resolves. If startup failed, propagate the leader's exception
+            # so the follower doesn't yield a SandboxSession against a
+            # remote session that does not exist.
             await tracked.start_ready.wait()
             if tracked.start_error is not None:
                 raise tracked.start_error
             tracked.in_flight_count += 1
             tracked.last_used = monotonic()
+            session_handle = tracked.handle
 
         try:
-            yield SandboxSession(backend, session_key)
+            yield SandboxSession(backend, session_key, session_handle)
         finally:
-            await self._release(key, key_lock)
+            await self._release(session_key, key_lock)
 
-    async def evict_for_backend(self, backend: SandboxBackend) -> None:
-        """Evict all tracked sessions for ``backend``.
+    async def evict_for_session_key(self, session_key: str) -> None:
+        """Evict a single ``session_key`` entry.
 
-        Sessions with ``in_flight_count == 0`` are stopped immediately.
-        In-use sessions are marked for eviction and stopped on release.
-        Stateless backends are a no-op.
+        If the entry has ``in_flight_count == 0`` it is closed immediately;
+        otherwise it is marked for eviction and closed on release. No-op
+        when the key is untracked.
         """
-        if isinstance(backend, BaseNoSessionBackend):
-            return
-        await self._evict_matching(lambda t: t.backend is backend)
+        await self._evict_targets([session_key])
 
-    async def evict_for_backend_type(self, backend_type: type) -> None:
-        """Evict all tracked sessions for any backend that is an instance of
-        ``backend_type``."""
-        await self._evict_matching(lambda t: isinstance(t.backend, backend_type))
+    async def evict_for_provider_family(self, family: str) -> None:
+        """Evict every tracked session whose adapter family matches ``family``.
 
-    async def evict_for_backend_key(
-        self,
-        backend: SandboxBackend,
-        session_key: str,
-    ) -> None:
-        """Evict a single (backend, session_key) entry. No-op if untracked
-        or if backend is stateless."""
-        if isinstance(backend, BaseNoSessionBackend):
-            return
-        target_key = (id(backend), session_key)
+        Sessions with ``in_flight_count == 0`` are closed immediately;
+        in-use sessions are marked for close-on-release.
+        """
+        await self._ensure_state_lock()
+        assert self._state_lock is not None
+        async with self._state_lock:
+            targets = [k for k, t in self._tracked.items() if t.family == family]
+        await self._evict_targets(targets)
 
-        def _match(t: _TrackedSession) -> bool:
-            return (id(t.backend), t.session_key) == target_key
-
-        await self._evict_matching(_match)
-
-    def schedule_eviction(
-        self,
-        backend: SandboxBackend,
-        session_key: str,
-    ) -> None:
-        """Schedule a fire-and-forget eviction of (backend, session_key).
+    def schedule_eviction(self, session_key: str) -> None:
+        """Schedule a fire-and-forget eviction of ``session_key``.
 
         Used by callers that cannot await the eviction inline — notably the
         per-execute timeout teardown in ``CodeEvaluatorRunner.evaluate``,
-        which runs in both a GraphQL request scope and the ``ExperimentRunner``
-        daemon scope. The created task is retained on the manager so it is
-        awaited (not cancelled) during shutdown, completing the underlying
-        ``backend.stop_session`` rather than leaking the orphan.
+        which runs in both a GraphQL request scope and the
+        ``ExperimentRunner`` daemon scope. The created task is retained on
+        the manager so it is awaited (not cancelled) during shutdown,
+        completing the underlying ``backend.close_session`` rather than
+        leaking the orphan.
         """
-        if isinstance(backend, BaseNoSessionBackend):
-            return
         if self._pending_tasks is None:
             self._pending_tasks = set()
-        task: Task[None] = asyncio.create_task(self.evict_for_backend_key(backend, session_key))
+        task: Task[None] = asyncio.create_task(self.evict_for_session_key(session_key))
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
@@ -410,14 +438,13 @@ class SandboxSessionManager(DaemonTask):
 
         Ordering matters: ``_pending_tasks`` (fire-and-forget evictions
         scheduled via ``schedule_eviction``) are awaited first so the
-        underlying ``backend.stop_session`` calls complete instead of being
-        cancelled mid-flight; then each unique backend tracked in
-        ``_tracked`` is drained via ``evict_for_backend`` (which marks
-        in-flight entries for eviction and waits up to
-        ``eviction_grace_seconds`` for them to release); finally
-        ``super().stop()`` cancels the sweeper task. The combined wall
-        clock budget must fit within ``DaemonTask.stop``'s 10s ceiling:
-        ``eviction_grace_seconds * N_unique_backends + drain(_pending_tasks)``.
+        underlying ``backend.close_session`` calls complete instead of
+        being cancelled mid-flight; then every tracked ``session_key`` is
+        drained via ``_evict_targets`` (which marks in-flight entries for
+        eviction and waits up to ``eviction_grace_seconds`` for them to
+        release); finally ``super().stop()`` cancels the sweeper task.
+        The combined wall clock budget must fit within
+        ``DaemonTask.stop``'s 10s ceiling.
         """
         # Drain pending evictions first — they may already be the call that
         # would have popped a tracked entry. Use gather(return_exceptions=True)
@@ -435,27 +462,18 @@ class SandboxSessionManager(DaemonTask):
                     "Pending sandbox eviction tasks did not drain within %.2fs",
                     self._eviction_grace_seconds,
                 )
-        # Snapshot unique backends under the state lock; iterate evictions
-        # outside the lock so each per-backend drain holds only its own
-        # per-key locks (avoiding cross-key lock contention during shutdown).
+        # Snapshot every tracked session_key under the state lock; drain
+        # outside the lock so each per-key drain holds only its own per-key
+        # lock (avoiding cross-key lock contention during shutdown).
         await self._ensure_state_lock()
         assert self._state_lock is not None
         async with self._state_lock:
-            seen_ids: set[int] = set()
-            unique_backends: list[SandboxBackend] = []
-            for tracked in self._tracked.values():
-                bid = id(tracked.backend)
-                if bid not in seen_ids:
-                    seen_ids.add(bid)
-                    unique_backends.append(tracked.backend)
-        for backend in unique_backends:
+            tracked_keys = list(self._tracked.keys())
+        if tracked_keys:
             try:
-                await self.evict_for_backend(backend)
+                await self._evict_targets(tracked_keys)
             except Exception:
-                logger.exception(
-                    "Failed to evict sandbox backend during shutdown: backend=%r",
-                    type(backend).__name__,
-                )
+                logger.exception("Failed to drain tracked sandbox sessions during shutdown")
         await super().stop()
 
     # ------------------------------------------------------------------
@@ -466,42 +484,43 @@ class SandboxSessionManager(DaemonTask):
         if self._state_lock is None:
             self._state_lock = Lock()
 
-    async def _get_or_create_key_lock(self, key: tuple[int, str]) -> Lock:
+    async def _get_or_create_key_lock(self, session_key: str) -> Lock:
         assert self._state_lock is not None
         async with self._state_lock:
-            lock = self._key_locks.get(key)
+            lock = self._key_locks.get(session_key)
             if lock is None:
                 lock = Lock()
-                self._key_locks[key] = lock
+                self._key_locks[session_key] = lock
             return lock
 
     async def _get_or_reserve(
         self,
         backend: SandboxBackend,
-        key: tuple[int, str],
         session_key: str,
     ) -> tuple[_TrackedSession, bool]:
         """Atomically resolve an existing tracking slot or reserve a fresh one.
 
-        Under ``_state_lock``: (1) if ``_tracked[key]`` exists, return
-        ``(existing, False)`` without rechecking capacity — followers piggy-
-        back on the leader's reservation. (2) Otherwise enforce
-        ``max_sessions_per_backend`` and insert a fresh ``_TrackedSession``
-        whose ``start_ready`` is unset; return ``(new, True)``. The leader
-        (``is_new=True``) is responsible for invoking ``backend.start_session``
-        outside this lock and flipping ``start_ready`` when it resolves.
+        Under ``_state_lock``: (1) if ``_tracked[session_key]`` exists,
+        return ``(existing, False)`` without rechecking capacity — followers
+        piggy-back on the leader's reservation. (2) Otherwise enforce
+        ``max_sessions_per_provider`` (counted by adapter family) and insert
+        a fresh ``_TrackedSession`` whose ``start_ready`` is unset; return
+        ``(new, True)``. The leader (``is_new=True``) is responsible for
+        invoking ``backend.find_or_create_session`` outside this lock and
+        flipping ``start_ready`` when it resolves.
 
         Folding the existence check into the same critical section as the
         capacity check + insertion is what makes popping ``_key_locks`` safe:
         once the per-key lock is no longer the dedup authority, ``_state_lock``
         must be — so the existence check, capacity check, and insertion all
         run under it. The caller is responsible for popping the entry under
-        ``_state_lock`` if ``backend.start_session`` fails (see ``acquire``'s
-        rollback).
+        ``_state_lock`` if ``backend.find_or_create_session`` fails (see
+        ``acquire``'s rollback).
         """
         assert self._state_lock is not None
+        family = _family_of(backend)
         async with self._state_lock:
-            existing = self._tracked.get(key)
+            existing = self._tracked.get(session_key)
             if existing is not None:
                 # Refuse to admit new callers onto a session that another
                 # caller has explicitly invalidated. The entry is draining
@@ -512,93 +531,95 @@ class SandboxSessionManager(DaemonTask):
                 if existing.marked_for_eviction:
                     raise SessionInvalidated()
                 return existing, False
-            backend_id = id(backend)
-            count = sum(1 for (bid, _) in self._tracked if bid == backend_id)
-            if count >= self._max_sessions_per_backend:
+            count = sum(1 for t in self._tracked.values() if t.family == family)
+            if count >= self._max_sessions_per_provider:
                 raise SessionLimitExceeded()
-            tracked = _TrackedSession(backend=backend, session_key=session_key)
-            self._tracked[key] = tracked
+            tracked = _TrackedSession(
+                backend=backend,
+                session_key=session_key,
+                family=family,
+            )
+            self._tracked[session_key] = tracked
             return tracked, True
 
-    async def _release(self, key: tuple[int, str], key_lock: Lock) -> None:
+    async def _release(self, session_key: str, key_lock: Lock) -> None:
         # ``acquire`` passes the lock reference it captured at acquire-time,
         # so ``_release`` never has to look ``_key_locks`` up. The lock
         # object outlives its dict entry, which is what makes popping
         # ``_key_locks`` alongside ``_tracked`` safe — a coroutine that
         # captured the lock before a concurrent eviction popped the dict
         # entry still releases through the same Lock instance.
-        # Snapshot decisions under the per-key lock, run stop_session
+        # Snapshot decisions under the per-key lock, run close_session
         # outside the lock to avoid blocking other acquires on the same key.
-        stop_backend: Optional[SandboxBackend] = None
-        stop_key: Optional[str] = None
+        close_backend: Optional[SandboxBackend] = None
+        close_key: Optional[str] = None
         async with key_lock:
-            tracked = self._tracked.get(key)
+            tracked = self._tracked.get(session_key)
             if tracked is None:
                 return
             tracked.in_flight_count = max(0, tracked.in_flight_count - 1)
             tracked.last_used = monotonic()
             if tracked.marked_for_eviction and tracked.in_flight_count == 0:
-                stop_backend = tracked.backend
-                stop_key = tracked.session_key
-                self._tracked.pop(key, None)
-                self._key_locks.pop(key, None)
-        if stop_backend is not None and stop_key is not None:
+                close_backend = tracked.backend
+                close_key = tracked.session_key
+                self._tracked.pop(session_key, None)
+                self._key_locks.pop(session_key, None)
+        if close_backend is not None and close_key is not None:
             try:
-                await stop_backend.stop_session(stop_key)
+                await close_backend.close_session(close_key)
             except Exception:
                 logger.exception(
-                    "Failed to stop sandbox session on release: backend=%r key=%r",
-                    type(stop_backend).__name__,
-                    stop_key,
+                    "Failed to close sandbox session on release: backend=%r key=%r",
+                    type(close_backend).__name__,
+                    close_key,
                 )
 
-    async def _evict_matching(
-        self,
-        predicate: Callable[[_TrackedSession], bool],
-    ) -> None:
+    async def _evict_targets(self, targets: list[str]) -> None:
+        """Drain ``targets``: close idle entries immediately, mark in-flight
+        entries for stop-on-release, then poll up to ``eviction_grace_seconds``
+        for marked entries to drain.
+
+        ``targets`` may include keys that have already been removed (e.g.
+        by a concurrent release) — those are skipped silently.
+        """
         await self._ensure_state_lock()
-        # Collect targets under the state lock; act on each entry under its
-        # per-key lock so we don't race with concurrent acquire().
-        assert self._state_lock is not None
-        async with self._state_lock:
-            targets = [k for k, t in list(self._tracked.items()) if predicate(t)]
         # First pass: stop idle sessions immediately; mark in-flight sessions
         # for eviction. Track the latter (with the tracked instance, not just
         # the key) so the drain poll can identity-check against the same
         # entry — a fresh same-key acquire that pops the marked entry and
         # inserts a new one must not be misread as the marked entry having
         # drained.
-        marked: list[tuple[tuple[int, str], _TrackedSession]] = []
-        for key in targets:
-            key_lock = self._key_locks.get(key)
+        marked: list[tuple[str, _TrackedSession]] = []
+        for session_key in targets:
+            key_lock = self._key_locks.get(session_key)
             if key_lock is None:
                 continue
-            stop_backend: Optional[SandboxBackend] = None
-            stop_key: Optional[str] = None
+            close_backend: Optional[SandboxBackend] = None
+            close_key: Optional[str] = None
             async with key_lock:
-                tracked = self._tracked.get(key)
+                tracked = self._tracked.get(session_key)
                 if tracked is None:
                     continue
                 if tracked.in_flight_count == 0:
-                    stop_backend = tracked.backend
-                    stop_key = tracked.session_key
-                    self._tracked.pop(key, None)
-                    self._key_locks.pop(key, None)
+                    close_backend = tracked.backend
+                    close_key = tracked.session_key
+                    self._tracked.pop(session_key, None)
+                    self._key_locks.pop(session_key, None)
                 else:
                     tracked.marked_for_eviction = True
-                    marked.append((key, tracked))
-            if stop_backend is not None and stop_key is not None:
+                    marked.append((session_key, tracked))
+            if close_backend is not None and close_key is not None:
                 try:
-                    await stop_backend.stop_session(stop_key)
+                    await close_backend.close_session(close_key)
                 except Exception:
                     logger.exception(
-                        "Failed to stop sandbox session during eviction: backend=%r key=%r",
-                        type(stop_backend).__name__,
-                        stop_key,
+                        "Failed to close sandbox session during eviction: backend=%r key=%r",
+                        type(close_backend).__name__,
+                        close_key,
                     )
         # Second pass: wait up to ``eviction_grace_seconds`` for marked
         # sessions to drain. Once ``in_flight_count`` reaches zero, the
-        # corresponding ``_release`` callback fires ``backend.stop_session``
+        # corresponding ``_release`` callback fires ``backend.close_session``
         # and removes the entry from ``_tracked``. If the grace window
         # expires with sessions still in-flight, leave them marked — the
         # next release will still close them. This is a bounded best-effort
@@ -607,6 +628,7 @@ class SandboxSessionManager(DaemonTask):
             return
         deadline = monotonic() + self._eviction_grace_seconds
         poll_interval = min(0.05, max(0.005, self._eviction_grace_seconds / 20.0))
+        assert self._state_lock is not None
         while marked and monotonic() < deadline:
             await sleep(poll_interval)
             async with self._state_lock:
@@ -628,30 +650,30 @@ class SandboxSessionManager(DaemonTask):
                 for k, t in list(self._tracked.items())
                 if t.in_flight_count == 0 and now - t.last_used > ttl
             ]
-        for key in candidates:
-            key_lock = self._key_locks.get(key)
+        for session_key in candidates:
+            key_lock = self._key_locks.get(session_key)
             if key_lock is None:
                 continue
-            stop_backend: Optional[SandboxBackend] = None
-            stop_key: Optional[str] = None
+            close_backend: Optional[SandboxBackend] = None
+            close_key: Optional[str] = None
             async with key_lock:
-                tracked = self._tracked.get(key)
+                tracked = self._tracked.get(session_key)
                 if tracked is None:
                     continue
                 if tracked.in_flight_count != 0:
                     continue
                 if monotonic() - tracked.last_used <= ttl:
                     continue
-                stop_backend = tracked.backend
-                stop_key = tracked.session_key
-                self._tracked.pop(key, None)
-                self._key_locks.pop(key, None)
-            if stop_backend is not None and stop_key is not None:
+                close_backend = tracked.backend
+                close_key = tracked.session_key
+                self._tracked.pop(session_key, None)
+                self._key_locks.pop(session_key, None)
+            if close_backend is not None and close_key is not None:
                 try:
-                    await stop_backend.stop_session(stop_key)
+                    await close_backend.close_session(close_key)
                 except Exception:
                     logger.exception(
-                        "Failed to stop idle sandbox session: backend=%r key=%r",
-                        type(stop_backend).__name__,
-                        stop_key,
+                        "Failed to close idle sandbox session: backend=%r key=%r",
+                        type(close_backend).__name__,
+                        close_key,
                     )
