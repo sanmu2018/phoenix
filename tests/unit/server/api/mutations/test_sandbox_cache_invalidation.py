@@ -313,7 +313,6 @@ class TestUpsertOrDeleteSecretsCacheInvalidation:
                 backend_type=backend_type,
                 language="PYTHON",
                 enabled=True,
-                config={},
             )
             session.add(provider)
             await session.flush()
@@ -523,7 +522,6 @@ class TestSessionManagerEvictionCoordination:
                 backend_type=backend_type,
                 language="PYTHON",
                 enabled=True,
-                config={},
             )
             session.add(provider)
             await session.flush()

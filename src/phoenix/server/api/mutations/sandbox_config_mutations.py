@@ -41,6 +41,8 @@ from phoenix.server.api.types.SandboxConfig import (
 )
 from phoenix.server.sandbox import (
     _SANDBOX_ADAPTERS,
+    invalidate_backend_cache,
+    invalidate_backend_cache_for_key,
     is_reserved_credential_name,
 )
 
@@ -430,6 +432,12 @@ class SandboxConfigMutationMixin:
                     on_conflict=OnConflict.DO_UPDATE,
                 )
             )
+        # Key-level fan-out covers shared credential_specs (e.g.,
+        # VERCEL_TOKEN shared between VERCEL_PYTHON and
+        # VERCEL_TYPESCRIPT). Per-backend_type
+        # invalidation remains as a defense-in-depth backstop.
+        await invalidate_backend_cache_for_key(key)
+        await invalidate_backend_cache(backend_type)
         return SetSandboxCredentialPayload(backend_type=backend_type, key=key, query=Query())
 
     @strawberry.mutation(
@@ -448,4 +456,8 @@ class SandboxConfigMutationMixin:
 
         async with info.context.db() as session:
             await session.execute(sa.delete(models.Secret).where(models.Secret.key == key))
+        # Key-level fan-out covers shared credential_specs; per-backend_type call
+        # remains as a defense-in-depth backstop.
+        await invalidate_backend_cache_for_key(key)
+        await invalidate_backend_cache(backend_type)
         return DeleteSandboxCredentialPayload(backend_type=backend_type, key=key, query=Query())

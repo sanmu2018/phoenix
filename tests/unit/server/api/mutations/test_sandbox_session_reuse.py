@@ -133,7 +133,6 @@ async def _seed_provider_and_config(
             backend_type=backend_type,
             language="PYTHON",
             enabled=True,
-            config={},
         )
         session.add(provider)
         await session.flush()
