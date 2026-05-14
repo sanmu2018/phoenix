@@ -7,7 +7,7 @@ Scope: E2B-specific SDK kwarg shapes, pip-install-via-run_code wiring, and
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -457,5 +457,7 @@ class TestE2BCrossWrapperConvergence:
         cls_b.create.assert_not_awaited()
         cls_b.connect.assert_awaited_once()
         # The handles point at the same underlying sandbox_id (cross-wrapper
-        # convergence).
-        assert handle_a.sandbox_id == handle_b.sandbox_id
+        # convergence). Cast through Any: find_or_create_session is typed
+        # ``object`` (opaque handle) by contract, so the test reaches through
+        # to assert on the concrete e2b-shaped attribute.
+        assert cast(Any, handle_a).sandbox_id == cast(Any, handle_b).sandbox_id

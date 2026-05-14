@@ -188,9 +188,7 @@ class ModalSandboxBackend(SandboxBackend):
 
         client = await self._ensure_client()
         try:
-            sandbox = await modal.Sandbox.from_name.aio(
-                self._app_name, name, client=client
-            )
+            sandbox = await modal.Sandbox.from_name.aio(self._app_name, name, client=client)
         except NotFoundError:
             return None
         # poll() returns None while running, else the exit code: a non-None
@@ -204,7 +202,6 @@ class ModalSandboxBackend(SandboxBackend):
         return sandbox
 
     async def find_or_create_session(self, session_key: str) -> Sandbox:
-        import modal
         from modal.exception import AlreadyExistsError
 
         name = self.provider_session_id(session_key)
@@ -250,9 +247,7 @@ class ModalSandboxBackend(SandboxBackend):
         name = self.provider_session_id(session_key)
         client = await self._ensure_client()
         try:
-            sandbox = await modal.Sandbox.from_name.aio(
-                self._app_name, name, client=client
-            )
+            sandbox = await modal.Sandbox.from_name.aio(self._app_name, name, client=client)
         except NotFoundError:
             return
         try:

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -477,7 +477,9 @@ class TestFindOrCreateSessionConvergence:
         client_a.create.assert_awaited_once()
         client_b.create.assert_not_awaited()
         client_b.get.assert_awaited_once()
-        assert handle_a.id == handle_b.id
+        # find_or_create_session returns an opaque ``object`` handle by
+        # contract; cast to read the daytona-shaped ``id`` attribute.
+        assert cast(Any, handle_a).id == cast(Any, handle_b).id
 
 
 class TestCloseSession:

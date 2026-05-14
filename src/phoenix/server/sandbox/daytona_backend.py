@@ -181,9 +181,7 @@ class DaytonaSandboxBackend(SandboxBackend):
                 f"(exit {result.exit_code}): {result.result}"
             )
 
-    def _create_params(
-        self, session_key: Optional[str] = None
-    ) -> CreateSandboxFromSnapshotParams:
+    def _create_params(self, session_key: Optional[str] = None) -> CreateSandboxFromSnapshotParams:
         """Build params for ``client.create()``.
 
         When ``session_key`` is supplied (the session-reuse path), it is added
@@ -299,8 +297,7 @@ class DaytonaSandboxBackend(SandboxBackend):
                         )
                         return sandbox
                     logger.debug(
-                        "Daytona sandbox_id=%s for key=%r failed alive probe; "
-                        "creating a fresh one",
+                        "Daytona sandbox_id=%s for key=%r failed alive probe; creating a fresh one",
                         sandbox_id,
                         session_key,
                     )
@@ -366,9 +363,7 @@ class DaytonaSandboxBackend(SandboxBackend):
                 try:
                     await client.delete(workspace)
                 except Exception:
-                    logger.warning(
-                        "Failed to delete ephemeral Daytona workspace", exc_info=True
-                    )
+                    logger.warning("Failed to delete ephemeral Daytona workspace", exc_info=True)
         except Exception as exc:
             return ExecutionResult(stdout="", stderr=str(exc), error=str(exc))
 

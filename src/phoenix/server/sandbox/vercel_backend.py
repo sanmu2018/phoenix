@@ -420,8 +420,7 @@ class VercelSandboxBackend(SandboxBackend):
                 await sandbox.client.aclose()
             except Exception:
                 logger.debug(
-                    "Vercel close_session: client.aclose failed for sandbox_id=%s "
-                    "key=%r",
+                    "Vercel close_session: client.aclose failed for sandbox_id=%s key=%r",
                     sandbox_id,
                     session_key,
                     exc_info=True,
