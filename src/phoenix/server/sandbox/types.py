@@ -480,7 +480,7 @@ class SandboxBackend(ABC):
         any ``Exception`` raised here. Backends that mind orphaned
         provider-side resources (running container, billed minutes) should
         either retry internally or rely on the provider's idle-reclamation
-        timeout (configured per-provider via the D8 hard-coded TTL kwargs in
+        timeout (configured per-provider via the hard-coded TTL kwargs in
         ``find_or_create_session``) — the manager will not re-drive a failed
         ``close_session``.
         """

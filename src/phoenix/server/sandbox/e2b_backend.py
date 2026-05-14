@@ -45,7 +45,7 @@ ENV_E2B_API_KEY = "E2B_API_KEY"
 # is stored as-is (no transform).
 _METADATA_SESSION_KEY = "phoenix_session_key"
 
-# D8: hard-coded max-lifetime ceiling. The E2B SDK default is 300s (5 min);
+# Hard-coded max-lifetime ceiling. The E2B SDK default is 300s (5 min);
 # Phoenix passes 600s explicitly so the provider reaps orphans after a hard
 # Phoenix crash without depending on the SDK default.
 _SESSION_TIMEOUT_SECONDS = 600
@@ -386,8 +386,8 @@ class E2BSandboxBackend(SandboxBackend):
     async def close(self) -> None:
         """Wrapper-level close.
 
-        Backend wrappers are ephemeral (one per request after D3); there is
-        no per-backend state to release here. Per-session cleanup is the
+        Backend wrappers are ephemeral (one per request); there is no
+        per-backend state to release here. Per-session cleanup is the
         manager's job via ``close_session``.
         """
         return None

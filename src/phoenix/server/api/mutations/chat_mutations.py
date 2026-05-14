@@ -460,8 +460,8 @@ class ChatCompletionMutationMixin:
         Evicts the single ``inline:<session_id>`` key from the manager. The
         manager no-ops on absent keys. Returns once the eviction request is
         accepted — backend.close_session may still be in progress on a
-        background task. Provider-side max-lifetime TTLs (D8) reap any
-        orphaned variants from mid-iteration SandboxConfig changes.
+        background task. Provider-side max-lifetime TTLs reap any orphaned
+        variants from mid-iteration SandboxConfig changes.
         """
         manager = info.context.sandbox_session_manager
         await manager.evict_for_session_key(f"inline:{session_id}")

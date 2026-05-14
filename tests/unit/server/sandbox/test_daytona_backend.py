@@ -154,14 +154,14 @@ class TestCodeRunParamsKwarg:
         assert params.env is None
 
 
-class TestCreateParamsD8AndLabelKwargs:
-    """``find_or_create_session`` must tag the create params with the D8 TTL
+class TestCreateParamsTTLAndLabelKwargs:
+    """``find_or_create_session`` must tag the create params with the TTL
     kwargs (``auto_stop_interval=5``, ``auto_archive_interval=15``) and the
     ``phoenix_session_key`` label so cross-replica list-by-label converges.
     """
 
     @pytest.mark.asyncio
-    async def test_create_params_carry_d8_ttl_and_session_label(self) -> None:
+    async def test_create_params_carry_ttl_and_session_label(self) -> None:
         daytona_mod, process_mod = _make_daytona_mocks()
         modules = {
             "daytona_sdk": daytona_mod,

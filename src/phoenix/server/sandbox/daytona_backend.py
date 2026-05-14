@@ -71,7 +71,7 @@ _DEFAULT_LANGUAGE = "PYTHON"
 # is stored as-is (no transform).
 _LABEL_SESSION_KEY = "phoenix_session_key"
 
-# D8: hard-coded provider-side TTL kwargs. Units are minutes (per Daytona SDK
+# Hard-coded provider-side TTL kwargs. Units are minutes (per Daytona SDK
 # docstring on ``CreateSandboxBaseParams``). ``auto_stop_interval=5`` stops
 # the sandbox after 5 idle minutes; ``auto_archive_interval=15`` archives a
 # stopped sandbox after 15 minutes. The pair caps how long a leaked sandbox
@@ -186,7 +186,7 @@ class DaytonaSandboxBackend(SandboxBackend):
 
         When ``session_key`` is supplied (the session-reuse path), it is added
         under ``_LABEL_SESSION_KEY`` so the sandbox can be rediscovered via
-        ``client.list(labels=...)``. D8 TTL kwargs (``auto_stop_interval``,
+        ``client.list(labels=...)``. TTL kwargs (``auto_stop_interval``,
         ``auto_archive_interval``) are always set so provider-side reclamation
         bounds leaked sandboxes after a hard Phoenix crash.
         """
@@ -399,8 +399,8 @@ class DaytonaSandboxBackend(SandboxBackend):
     async def close(self) -> None:
         """Wrapper-level close.
 
-        Backend wrappers are ephemeral (one per request after D3); there is
-        no per-backend session state to release here. Per-session cleanup is
+        Backend wrappers are ephemeral (one per request); there is no
+        per-backend session state to release here. Per-session cleanup is
         the manager's job via ``close_session``. The lazy SDK client is
         closed so the underlying httpx pool does not leak.
         """

@@ -327,7 +327,7 @@ def test_provider_session_id_is_sha256_prefix_alphanumeric_le_32_chars() -> None
 
 
 # ---------------------------------------------------------------------------
-# find_or_create_session — Modal name-uniqueness binding + D8 TTL kwargs
+# find_or_create_session — Modal name-uniqueness binding + TTL kwargs
 # ---------------------------------------------------------------------------
 
 
@@ -365,7 +365,7 @@ async def test_find_or_create_session_creates_when_from_name_raises_not_found() 
 
     modal_mock.Sandbox.create.aio.assert_awaited_once()
     create_kwargs = modal_mock.Sandbox.create.aio.call_args.kwargs
-    # D8 TTL kwargs hard-coded on every create.
+    # TTL kwargs hard-coded on every create.
     assert create_kwargs["timeout"] == 600
     assert create_kwargs["idle_timeout"] == 300
     # Name derives from provider_session_id, NOT the raw session_key.

@@ -92,8 +92,8 @@ def test_create_kwargs_defaults_to_allow_true() -> None:
     assert backend._create_kwargs(session_key=None)["allow_internet_access"] is True
 
 
-def test_create_kwargs_hardcodes_d8_timeout() -> None:
-    """D8: every create() call must carry ``timeout=600``."""
+def test_create_kwargs_hardcodes_timeout() -> None:
+    """Every create() call must carry ``timeout=600``."""
     backend = E2BSandboxBackend(api_key=_API_KEY, template="base")
     kwargs = backend._create_kwargs(session_key=None)
     assert kwargs["timeout"] == _SESSION_TIMEOUT_SECONDS == 600

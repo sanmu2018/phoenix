@@ -2,7 +2,7 @@
 
 Scope: SDK kwarg shapes, runtime package install, network_policy forwarding,
 ``find_or_create_session`` via the module-level ``_session_id_map``, and
-the D8 ``timeout=timedelta(seconds=600)`` create kwarg.
+the hard-coded ``timeout=timedelta(seconds=600)`` create kwarg.
 """
 
 from __future__ import annotations
@@ -233,10 +233,10 @@ async def test_ephemeral_execute_runs_install_before_user_code(
 
 
 @pytest.mark.asyncio
-async def test_create_sandbox_passes_d8_timeout_as_timedelta(
+async def test_create_sandbox_passes_timeout_as_timedelta(
     patched_vercel_sdk_with_kwargs: list[dict[str, Any]],
 ) -> None:
-    """D8: every ``AsyncSandbox.create`` must carry ``timeout=timedelta(seconds=600)``.
+    """Every ``AsyncSandbox.create`` must carry ``timeout=timedelta(seconds=600)``.
 
     The Vercel SDK interprets bare-int ``timeout`` as milliseconds, so we
     pass a ``timedelta`` explicitly to make the unit unambiguous.

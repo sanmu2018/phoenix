@@ -96,7 +96,7 @@ _LANGUAGE_CONFIGS: dict[str, _LanguageConfig] = {
 }
 _DEFAULT_LANGUAGE = "TYPESCRIPT"
 
-# D8 max-lifetime ceiling for Vercel sandboxes. Vercel's SDK accepts an int
+# Max-lifetime ceiling for Vercel sandboxes. Vercel's SDK accepts an int
 # (interpreted as **milliseconds**) or a ``timedelta``; we pass a ``timedelta``
 # to keep the unit unambiguous at the call site. 600 s == 10 min, well under
 # Vercel's 45 min hard cap and above the SDK's 5 min default.
@@ -226,7 +226,7 @@ class VercelSandboxBackend(SandboxBackend):
             "token": str(self._token),
             "project_id": str(self._project_id),
             "team_id": str(self._team_id),
-            # D8: hard-coded max-lifetime ceiling so a hard-crashed Phoenix
+            # Hard-coded max-lifetime ceiling so a hard-crashed Phoenix
             # process cannot leak provider-side sandboxes indefinitely. The
             # Vercel SDK interprets int ``timeout`` as milliseconds; we pass
             # a ``timedelta`` to make the unit unambiguous at the call site.
