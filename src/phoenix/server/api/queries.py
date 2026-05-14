@@ -211,7 +211,24 @@ class ExperimentRunMetricComparisons:
 
 
 @strawberry.type
+class AgentTraceRecording:
+    allow_local_traces: bool
+    allow_remote_export: bool
+
+
+@strawberry.type
 class Query:
+    @strawberry.field
+    async def agent_trace_recording(
+        self,
+        info: Info[Context, None],
+    ) -> AgentTraceRecording:
+        s = info.context.settings.agent_trace_recording
+        return AgentTraceRecording(
+            allow_local_traces=s.allow_local_traces,
+            allow_remote_export=s.allow_remote_export,
+        )
+
     @strawberry.field
     async def model_providers(self, info: Info[Context, None]) -> list[GenerativeProvider]:
         available_providers = PLAYGROUND_CLIENT_REGISTRY.list_all_providers()

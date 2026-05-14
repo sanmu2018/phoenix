@@ -377,14 +377,17 @@ def create_agents_router(authentication_enabled: bool) -> APIRouter:
         if agent_id != _ASSISTANT_AGENT_ID:
             raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id!r}")
         body = request_body.root
+        recording = request.app.state.system_settings.agent_trace_recording
+        ingest_traces = bool(body.ingest_traces and recording.allow_local_traces)
+        export_remote_traces = bool(body.export_remote_traces and recording.allow_remote_export)
         project_name = get_env_phoenix_agents_assistant_project_name()
         tracer = (
             Tracer(
                 span_cost_calculator=request.app.state.span_cost_calculator,
-                enable_remote_export=body.export_remote_traces,
+                enable_remote_export=export_remote_traces,
                 project_name=project_name,
             )
-            if (body.ingest_traces or body.export_remote_traces)
+            if (ingest_traces or export_remote_traces)
             else None
         )
         tracer_provider = tracer.tracer_provider if tracer is not None else None
@@ -439,7 +442,7 @@ def create_agents_router(authentication_enabled: bool) -> APIRouter:
             finally:
                 if tracer is not None:
                     tracer.tracer_provider.force_flush()
-                    if body.ingest_traces:
+                    if ingest_traces:
                         project_id = await _ensure_project_exists(
                             request.app.state.db, project_name
                         )
@@ -464,14 +467,17 @@ def create_agents_router(authentication_enabled: bool) -> APIRouter:
     ) -> _SummarizeResponse:
         if agent_id != _ASSISTANT_AGENT_ID:
             raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id!r}")
+        recording = request.app.state.system_settings.agent_trace_recording
+        ingest_traces = bool(body.ingest_traces and recording.allow_local_traces)
+        export_remote_traces = bool(body.export_remote_traces and recording.allow_remote_export)
         project_name = get_env_phoenix_agents_assistant_project_name()
         tracer = (
             Tracer(
                 span_cost_calculator=request.app.state.span_cost_calculator,
-                enable_remote_export=body.export_remote_traces,
+                enable_remote_export=export_remote_traces,
                 project_name=project_name,
             )
-            if (body.ingest_traces or body.export_remote_traces)
+            if (ingest_traces or export_remote_traces)
             else None
         )
         tracer_provider = tracer.tracer_provider if tracer is not None else None
@@ -496,7 +502,7 @@ def create_agents_router(authentication_enabled: bool) -> APIRouter:
         finally:
             if tracer is not None:
                 tracer.tracer_provider.force_flush()
-                if body.ingest_traces:
+                if ingest_traces:
                     project_id = await _ensure_project_exists(request.app.state.db, project_name)
                     db_traces = tracer.get_db_traces(project_id=project_id)
                     if db_traces:

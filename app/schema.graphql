@@ -77,6 +77,11 @@ input AddSpansToDatasetInput {
   datasetVersionMetadata: JSON
 }
 
+type AgentTraceRecording {
+  allowLocalTraces: Boolean!
+  allowRemoteExport: Boolean!
+}
+
 type AgentsConfig {
   """
   The collector endpoint used by the server-side agents to export traces. Resolved from the PHOENIX_AGENTS_COLLECTOR_ENDPOINT environment variable.
@@ -2187,6 +2192,7 @@ input ModelsInput {
 }
 
 type Mutation {
+  setAgentTraceRecording(input: SetAgentTraceRecordingInput!): AgentTraceRecording!
   createAnnotationConfig(input: CreateAnnotationConfigInput!): CreateAnnotationConfigPayload!
   updateAnnotationConfig(input: UpdateAnnotationConfigInput!): UpdateAnnotationConfigPayload!
   deleteAnnotationConfigs(input: DeleteAnnotationConfigsInput!): DeleteAnnotationConfigsPayload!
@@ -3209,6 +3215,7 @@ type PromptVersionTagMutationPayload {
 }
 
 type Query {
+  agentTraceRecording: AgentTraceRecording!
   modelProviders: [GenerativeProvider!]!
   generativeModelCustomProviders(first: Int = 50, last: Int, after: String, before: String): GenerativeModelCustomProviderConnection!
   secrets(keys: [String!] = null, first: Int = 50, last: Int, after: String, before: String): SecretConnection!
@@ -3397,6 +3404,11 @@ scalar SecretString
 
 type ServerStatus {
   insufficientStorage: Boolean!
+}
+
+input SetAgentTraceRecordingInput {
+  allowLocalTraces: Boolean!
+  allowRemoteExport: Boolean!
 }
 
 input SetDatasetExampleSplitsInput {

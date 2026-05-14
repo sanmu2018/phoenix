@@ -185,6 +185,7 @@ from phoenix.server.daemons.experiment_runner import ExperimentRunner
 from phoenix.server.daemons.experiment_sweeper import ExperimentSweeper
 from phoenix.server.daemons.generative_model_store import GenerativeModelStore
 from phoenix.server.daemons.span_cost_calculator import SpanCostCalculator
+from phoenix.server.daemons.system_settings import SystemSettings
 from phoenix.server.dml_event import DmlEvent
 from phoenix.server.dml_event_handler import DmlEventHandler
 from phoenix.server.email.types import EmailSender
@@ -196,6 +197,7 @@ from phoenix.server.oauth2 import OAuth2Clients
 from phoenix.server.prometheus import SPAN_QUEUE_REJECTIONS
 from phoenix.server.redaction import Redactor, current_redactor
 from phoenix.server.retention import TraceDataSweeper
+from phoenix.server.settings.registry import SETTINGS_REGISTRY
 from phoenix.server.telemetry import initialize_opentelemetry_tracer_provider
 from phoenix.server.types import (
     CanGetLastUpdatedAt,
@@ -647,6 +649,7 @@ def _lifespan(
     experiment_sweeper: ExperimentSweeper,
     span_cost_calculator: SpanCostCalculator,
     generative_model_store: GenerativeModelStore,
+    system_settings: SystemSettings,
     db_disk_usage_monitor: DbDiskUsageMonitor,
     experiment_runner: ExperimentRunner,
     token_store: Optional[TokenStore] = None,
@@ -669,6 +672,7 @@ def _lifespan(
             if isinstance((res := callback()), Awaitable):
                 await res
         db.lock = asyncio.Lock() if db.dialect is SupportedSQLDialect.SQLITE else None
+        await system_settings.bootstrap()
         async with AsyncExitStack() as stack:
             (
                 enqueue_annotations,
@@ -698,6 +702,7 @@ def _lifespan(
             await stack.enter_async_context(experiment_sweeper)
             await stack.enter_async_context(span_cost_calculator)
             await stack.enter_async_context(generative_model_store)
+            await stack.enter_async_context(system_settings)
             await stack.enter_async_context(db_disk_usage_monitor)
             await stack.enter_async_context(experiment_runner)
             if docs_mcp_toolset is not None:
@@ -748,6 +753,7 @@ def create_graphql_router(
     *,
     graphql_schema: strawberry.Schema,
     db: DbSessionFactory,
+    system_settings: SystemSettings,
     last_updated_at: CanGetLastUpdatedAt,
     authentication_enabled: bool,
     span_cost_calculator: SpanCostCalculator,
@@ -785,6 +791,7 @@ def create_graphql_router(
     def get_context() -> Context:
         return Context(
             db=db,
+            settings=system_settings,
             allowed_provider_names=allowed_provider_names,
             last_updated_at=last_updated_at,
             event_queue=event_queue,
@@ -1143,6 +1150,7 @@ def create_app(
     )
     experiment_sweeper = ExperimentSweeper(db)
     generative_model_store = GenerativeModelStore(db)
+    system_settings = SystemSettings(db=db, registry=SETTINGS_REGISTRY)
     span_cost_calculator = SpanCostCalculator(db, generative_model_store)
     bulk_inserter = bulk_inserter_factory(
         db,
@@ -1182,6 +1190,7 @@ def create_app(
     )
     graphql_router = create_graphql_router(
         db=db,
+        system_settings=system_settings,
         graphql_schema=build_graphql_schema(graphql_schema_extensions),
         authentication_enabled=authentication_enabled,
         last_updated_at=last_updated_at,
@@ -1221,6 +1230,7 @@ def create_app(
             experiment_sweeper=experiment_sweeper,
             span_cost_calculator=span_cost_calculator,
             generative_model_store=generative_model_store,
+            system_settings=system_settings,
             db_disk_usage_monitor=DbDiskUsageMonitor(db, email_sender),
             experiment_runner=experiment_runner,
             grpc_interceptors=grpc_interceptors,
@@ -1334,6 +1344,7 @@ def create_app(
 
         app.state.ldap_authenticator = LDAPAuthenticator(ldap_config)
     app.state.db = db
+    app.state.system_settings = system_settings
     app.state.email_sender = email_sender
     app.state.span_cost_calculator = span_cost_calculator
     app.state.encrypt = encryption_service.encrypt
