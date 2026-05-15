@@ -30,3 +30,16 @@ manual-only.
 Examples may carry more than one split tag, but `val` must stay disjoint from
 both `regression` and `dev`. The loader enforces that contract and warns when an
 example is tagged with both `regression` and `holdout`.
+
+## Manual CI
+
+The `PXI Evals` GitHub Actions workflow runs live regression evals against
+Phoenix Cloud. It is intentionally manual-only: maintainers run it from the
+Actions tab on PR branches that change PXI evals or PXI agent behavior.
+
+The workflow invokes the runner for every YAML file in
+`evals/pxi/datasets/*.yaml` with `--splits regression` and
+`--fail-on-regression`. The runner skips datasets when the requested split has
+no regression examples. Each dataset run is printed as its own log group with
+the dataset file and CI experiment name. The workflow keeps going after
+individual dataset failures, and the final status is red if any dataset fails.
