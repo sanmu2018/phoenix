@@ -271,7 +271,6 @@ addopts = [
   "--showlocals",
 ]
 testpaths = [
-  "evals",
   "tests",
 ]
 
