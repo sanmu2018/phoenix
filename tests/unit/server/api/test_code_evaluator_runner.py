@@ -1275,10 +1275,13 @@ class TestSandboxSpanContract:
         """Stored evaluators thread the version GlobalID through to the
         Sandbox span as ``metadata.code_evaluator_version_id`` so a trace
         backlinks to the immutable source-of-record version."""
-        backend = AsyncMock()
-        backend.secret_values = frozenset()
-        backend.execute = AsyncMock(
-            return_value=ExecutionResult(stdout=_fenced('"pass"'), stderr="", error=None)
+        # Use the stateless test backend so the session manager's acquire
+        # short-circuits to ``execute`` (the AsyncMock that returns a real
+        # ExecutionResult). A bare AsyncMock() would route through
+        # ``execute_in_session`` and yield an AsyncMock-typed stdout.
+        backend = _StatelessTestBackend()
+        cast(AsyncMock, backend.execute).return_value = ExecutionResult(
+            stdout=_fenced('"pass"'), stderr="", error=None
         )
         version_gid = "Q29kZUV2YWx1YXRvclZlcnNpb246NDI="
         runner = CodeEvaluatorRunner(
