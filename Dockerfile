@@ -20,11 +20,12 @@
 # - https://github.com/Arize-ai/phoenix/issues
 
 ARG BASE_IMAGE=gcr.io/distroless/python3-debian13:nonroot
+ARG BUILDPLATFORM
 # To deploy it on an arm64, like Raspberry Pi or Apple-Silicon, chose this image instead:
 # ARG BASE_IMAGE=gcr.io/distroless/python3-debian13:nonroot-arm64
 
 # This Dockerfile is a multi-stage build. The first stage builds the frontend.
-FROM node:22-slim AS frontend-builder
+FROM --platform=$BUILDPLATFORM node:22-slim AS frontend-builder
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV PHOENIX_ENABLE_SOURCE_MAP=True

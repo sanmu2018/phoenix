@@ -52,14 +52,16 @@ export function getCurrentTheme(): ProviderTheme {
   }
 }
 
-export function getCurrentThemeMode(): ProviderThemeMode {
+export function getCurrentThemeMode(
+  defaultThemeMode: ProviderThemeMode = DEFAULT_THEME
+): ProviderThemeMode {
   const themeModeFromLocalStorage = localStorage.getItem(
     LOCAL_STORAGE_THEME_KEY
   );
   if (isProviderThemeMode(themeModeFromLocalStorage)) {
     return themeModeFromLocalStorage;
   }
-  return DEFAULT_THEME;
+  return defaultThemeMode;
 }
 
 function getSystemTheme(): ProviderTheme {
@@ -85,6 +87,10 @@ export function ThemeProvider(
      */
     themeMode?: ProviderThemeMode;
     /**
+     * The theme mode to use when the user has not selected one in this browser.
+     */
+    defaultThemeMode?: ProviderThemeMode;
+    /**
      * If true, skip adding theme classes to document.body.
      * Used in Storybook's "both" mode where multiple ThemeProviders coexist
      * and theme scoping is handled via container class names instead.
@@ -93,7 +99,7 @@ export function ThemeProvider(
   }>
 ) {
   const [themeMode, _setThemeMode] = useState<ProviderThemeMode>(
-    () => props.themeMode || getCurrentThemeMode()
+    () => props.themeMode || getCurrentThemeMode(props.defaultThemeMode)
   );
   const setThemeMode = useCallback((themeMode: ProviderThemeMode) => {
     localStorage.setItem(LOCAL_STORAGE_THEME_KEY, themeMode);

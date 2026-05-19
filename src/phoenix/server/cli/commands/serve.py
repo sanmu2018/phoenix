@@ -25,6 +25,7 @@ from phoenix.config import (
     get_env_dangerously_enable_agents,
     get_env_database_connection_str,
     get_env_database_schema,
+    get_env_default_theme_mode,
     get_env_enable_prometheus,
     get_env_grpc_port,
     get_env_host,
@@ -353,6 +354,7 @@ def run(args: Namespace) -> None:
         ldap_config=auth_settings.ldap_config,
         allowed_origins=allowed_origins,
         management_url=management_url,
+        default_theme_mode=get_env_default_theme_mode(),
     )
 
     server_config = Config(

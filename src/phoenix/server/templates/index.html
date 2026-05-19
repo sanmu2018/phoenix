@@ -99,6 +99,7 @@
           value: Object.freeze({
               basename: "{{basename}}",
               platformVersion: "{{platform_version}}",
+              defaultThemeMode: {{ default_theme_mode | tojson }},
               authenticationEnabled: Boolean("{{authentication_enabled}}" == "True"),
               oAuth2Idps: {{ oauth2_idps | tojson }},
               basicAuthDisabled: Boolean("{{basic_auth_disabled}}" == "True"),

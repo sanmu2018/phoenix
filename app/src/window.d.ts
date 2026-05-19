@@ -12,6 +12,7 @@ declare global {
       // Remote notebooks like SageMaker
       basename: string;
       platformVersion: string;
+      defaultThemeMode?: "light" | "dark" | "system" | null;
       authenticationEnabled: boolean;
       basicAuthDisabled: boolean;
       oAuth2Idps: OAuth2Idp[];

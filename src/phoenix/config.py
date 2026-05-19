@@ -693,6 +693,11 @@ When set, this email will be included in error messages for insufficient storage
 conditions and database usage notification emails, providing users with a direct
 contact for assistance. If not set, error messages will not include contact information.
 """
+ENV_PHOENIX_DEFAULT_THEME_MODE = "PHOENIX_DEFAULT_THEME_MODE"
+"""
+The default UI theme mode to apply when the browser has no stored preference.
+Defaults to light.
+"""
 
 # SMTP settings
 ENV_PHOENIX_SMTP_HOSTNAME = "PHOENIX_SMTP_HOSTNAME"
@@ -3308,6 +3313,20 @@ def get_env_support_email() -> Optional[str]:
     return getenv(ENV_PHOENIX_SUPPORT_EMAIL)
 
 
+def get_env_default_theme_mode() -> Literal["light", "dark", "system"]:
+    """
+    Get the default UI theme mode from the PHOENIX_DEFAULT_THEME_MODE environment variable.
+    """
+    if not (theme_mode := getenv(ENV_PHOENIX_DEFAULT_THEME_MODE)):
+        return "light"
+    normalized_theme_mode = theme_mode.strip().lower()
+    if normalized_theme_mode not in {"light", "dark", "system"}:
+        raise ValueError(
+            f"Invalid theme mode in {ENV_PHOENIX_DEFAULT_THEME_MODE}: '{theme_mode}'"
+        )
+    return cast(Literal["light", "dark", "system"], normalized_theme_mode)
+
+
 def validate_env_support_email() -> None:
     """
     Validate the support email address configured in PHOENIX_SUPPORT_EMAIL.
@@ -3333,6 +3352,7 @@ def verify_server_environment_variables() -> None:
     get_env_database_usage_insertion_blocking_threshold_percentage()
     get_env_max_spans_queue_size()
     validate_env_support_email()
+    get_env_default_theme_mode()
     validate_env_allowed_providers()
 
     # Notify users about deprecated environment variables if they are being used.

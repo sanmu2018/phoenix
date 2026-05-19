@@ -299,6 +299,8 @@ class AppConfig(NamedTuple):
     """ Whether the database has a threshold for usage """
     allow_external_resources: bool = True
     """ Whether to allow external resources like Google Fonts in the web interface """
+    default_theme_mode: str = "light"
+    """ Default UI theme mode when the browser has no stored preference """
     dev_vite_port: int = 5173
     """ Port the Vite dev server runs on. Only used in development mode. """
 
@@ -348,6 +350,7 @@ class Static(StaticFiles):
                 context={
                     "basename": get_root_path(scope),
                     "platform_version": phoenix_version,
+                    "default_theme_mode": self._app_config.default_theme_mode,
                     "is_development": self._app_config.is_development,
                     "vite_port": self._app_config.dev_vite_port,
                     "manifest": self._web_manifest,
@@ -1066,6 +1069,7 @@ def create_app(
     bulk_inserter_factory: Optional[Callable[..., BulkInserter]] = None,
     allowed_origins: Optional[list[str]] = None,
     management_url: Optional[str] = None,
+    default_theme_mode: str = "light",
     welcome_message: str | None = None,
 ) -> FastAPI:
     verify_server_environment_variables()
@@ -1302,6 +1306,7 @@ def create_app(
                         and get_env_database_usage_insertion_blocking_threshold_percentage()
                     ),
                     allow_external_resources=get_env_allow_external_resources(),
+                    default_theme_mode=default_theme_mode,
                     auth_error_messages=dict(AUTH_ERROR_MESSAGES) if authentication_enabled else {},
                     dev_vite_port=dev_vite_port,
                 ),

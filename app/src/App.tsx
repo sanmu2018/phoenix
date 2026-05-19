@@ -15,7 +15,9 @@ import "react-resizable/css/styles.css";
 export function App() {
   return (
     <FunctionalityProvider>
-      <ThemeProvider>
+      <ThemeProvider
+        defaultThemeMode={window.Config.defaultThemeMode ?? undefined}
+      >
         <AppContent />
       </ThemeProvider>
     </FunctionalityProvider>
