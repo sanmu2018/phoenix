@@ -243,9 +243,11 @@ class TestTimeoutTeardownKeying:
     Guards two bugs:
 
     1. Wrong session key (resource leak). When ``session_key`` is overridden
-       (the frontend-generated UUID path), teardown must use the override key
-       — not ``self._name``. Otherwise the backend's ``close_session`` looks
-       up a non-existent key and leaks the sandbox.
+       (the inline-preview path, where the mutation derives the key from
+       ``(user_id, sandbox_config_id, language)`` server-side instead of
+       using ``self._name``), teardown must use the override key — not
+       ``self._name``. Otherwise the backend's ``close_session`` looks up a
+       non-existent key and leaks the sandbox.
 
     2. Manager state desync (dead-session reuse). Teardown must route through
        ``schedule_eviction(session_key)`` so the manager's ``_tracked`` entry
@@ -257,7 +259,10 @@ class TestTimeoutTeardownKeying:
         backend = _SlowBackend()
         manager = SandboxSessionManager()
         manager.eviction_grace_seconds = 0.05
-        override = "00000000-1111-2222-3333-444444444444"
+        # Realistic inline-preview key shape: derived server-side from
+        # (user_id, sandbox_config_id, language). Format is manager-internal
+        # — chosen here so the test documents what real overrides look like.
+        override = "inline:42:U2FuZGJveENvbmZpZzox:python"
         runner = CodeEvaluatorRunner(
             name="test-runner",
             description=None,

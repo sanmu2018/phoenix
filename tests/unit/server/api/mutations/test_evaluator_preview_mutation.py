@@ -177,7 +177,6 @@ class TestInlineCodeEvaluatorPreviewMutation:
                                     "language": language,
                                     "sourceCode": source_code,
                                     "sandboxConfigId": sandbox_config_id,
-                                    "sessionId": "test-session-id",
                                     "outputConfigs": [
                                         {
                                             "continuous": {

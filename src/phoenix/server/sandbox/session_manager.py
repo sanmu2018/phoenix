@@ -403,12 +403,12 @@ class SandboxSessionManager(DaemonTask):
 
         Internally the manager keys ``_tracked`` on a composite of the logical
         session key and the backend's config fingerprint, so a single logical
-        key can have multiple tracked entries when the same frontend session
-        has run against different backend configs (e.g. mid-iteration
-        provider / packages / env-vars switch). A logical eviction drains
-        every variant under the same ``session_key`` so callers using the
-        chat ``stopEvaluatorSession`` mutation see the documented "stop this
-        session" semantics regardless of config drift.
+        key can have multiple tracked entries when the same caller has run
+        against different backend configs (e.g. mid-iteration provider /
+        packages / env-vars switch). A logical eviction drains every variant
+        under the same ``session_key`` so callers — including
+        ``schedule_eviction`` from the timeout-teardown path — get "stop this
+        logical session" semantics regardless of config drift.
 
         Entries with ``in_flight_count == 0`` are closed immediately; in-use
         entries are marked for eviction and closed on release. No-op when no

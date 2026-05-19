@@ -58,17 +58,6 @@ class EvaluatorPreviewsPayload:
     results: list[EvaluationResult]
 
 
-@strawberry.type
-class StopEvaluatorSessionPayload:
-    """Result of a best-effort sandbox-session eviction request."""
-
-    session_id: str
-    # Always ``True`` once the eviction request is accepted. The mutation
-    # does not block on backend.stop_session completion — the manager evicts
-    # in-flight sessions on release and immediately for idle ones.
-    stopped: bool
-
-
 def _to_annotation(eval_result: EvaluationResultDict) -> ExperimentRunAnnotation:
     return ExperimentRunAnnotation.from_dict(
         {
@@ -418,6 +407,29 @@ class ChatCompletionMutationMixin:
                     language=language,
                 )
 
+                # Inline-preview session keying is server-derived rather than
+                # client-supplied. Two design points worth keeping aligned:
+                #   1. ``user_id`` comes from the auth context, not a mutation
+                #      input — a malicious caller cannot land in another user's
+                #      session by spoofing a field. In no-auth mode user_id is
+                #      None and every caller is the same principal (the
+                #      ``anon`` sentinel collapses them onto one session, which
+                #      is consistent with no-auth's "one principal" semantics).
+                #   2. ``(sandbox_config_id, language)`` partitions sessions
+                #      across the dimensions that actually require distinct
+                #      backend sandboxes. Two builder tabs the same user has
+                #      open for the same (config, language) intentionally
+                #      share a hot session — that's the reuse this keying is
+                #      buying. Cleanup is the idle TTL on the manager; the
+                #      old ``stopEvaluatorSession`` mutation was best-effort
+                #      and is no longer needed.
+                # Format is manager-internal — callers must not parse it.
+                user_id = info.context.user_id
+                inline_session_key = (
+                    f"inline:{user_id if user_id is not None else 'anon'}"
+                    f":{inline_code_evaluator.sandbox_config_id}:{language}"
+                )
+
                 runner = CodeEvaluatorRunner(
                     name=evaluator_name,
                     description=evaluator_description,
@@ -426,10 +438,7 @@ class ChatCompletionMutationMixin:
                     sandbox_backend=sandbox_backend,
                     language=language,
                     timeout=sandbox_timeout,
-                    # Inline path: frontend generates a UUID at form-mount and
-                    # sends it on every evaluatorPreviews call so the session
-                    # survives rename mid-iteration.
-                    session_key=f"inline:{inline_code_evaluator.session_id}",
+                    session_key=inline_session_key,
                     sandbox_session_manager=info.context.sandbox_session_manager,
                 )
                 eval_results = await runner.evaluate(
@@ -445,23 +454,3 @@ class ChatCompletionMutationMixin:
                 raise BadRequest("Either evaluator_id or inline evaluator must be provided")
 
         return EvaluatorPreviewsPayload(results=all_results)
-
-    @strawberry.mutation(permission_classes=[IsNotReadOnly, IsNotViewer, IsLocked])  # type: ignore
-    @classmethod
-    async def stop_evaluator_session(
-        cls,
-        info: Info[Context, None],
-        session_id: str,
-    ) -> StopEvaluatorSessionPayload:
-        """Best-effort eviction of a sandbox session keyed by ``session_id``.
-
-        Evicts the single ``inline:<session_id>`` key from the manager. The
-        manager no-ops on absent keys. Returns once the eviction request is
-        accepted — backend.close_session may still be in progress on a
-        background task. Provider-side max-lifetime TTLs reap any orphaned
-        variants from mid-iteration SandboxConfig changes.
-        """
-        manager = info.context.sandbox_session_manager
-        await manager.evict_for_session_key(f"inline:{session_id}")
-
-        return StopEvaluatorSessionPayload(session_id=session_id, stopped=True)

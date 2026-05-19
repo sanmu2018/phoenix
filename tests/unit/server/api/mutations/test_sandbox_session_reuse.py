@@ -5,16 +5,20 @@ Each request now builds a fresh ``SandboxBackend`` via
 ``build_sandbox_backend`` (no process-level backend cache), and session
 reuse is bound at the provider via
 ``backend.find_or_create_session(session_key)``. Two ``evaluatorPreviews``
-calls for the same composed ``session_key`` ("inline:<session_id>" or
-"evaluator:<id>") must therefore:
+calls that derive the same ``session_key`` ("inline:<user_id>:<config_gid>:<language>"
+for inline previews, "evaluator:<id>" for stored evaluators) must therefore:
 
 1. Construct two distinct backend wrapper instances (fresh ``build_backend``
    per request) but converge on a single remote sandbox handle via a
    provider-native list/get (mirrored here by a module-level fake map).
 2. Re-use the manager-tracked session entry, so the second call does not
    re-invoke ``find_or_create_session`` on the same key.
-3. Fire ``close_session`` for the matching key when
-   ``stopEvaluatorSession`` runs.
+
+The inline-preview session key is now derived server-side from the caller's
+auth identity and ``(sandbox_config_id, language)``. The frontend no longer
+mints or echoes a session id, and the previously load-bearing test path —
+``stopEvaluatorSession`` — has been removed: eviction is the manager's idle
+TTL.
 
 The fake adapter below builds a fresh ``_FakeBackend`` instance per
 ``build_backend`` call (so wrapper identity churns the way Phoenix's real
@@ -49,15 +53,6 @@ mutation EvaluatorPreviews($input: EvaluatorPreviewsInput!) {
             evaluatorName
             error
         }
-    }
-}
-"""
-
-_STOP_EVALUATOR_SESSION = """
-mutation StopEvaluatorSession($sessionId: String!) {
-    stopEvaluatorSession(sessionId: $sessionId) {
-        sessionId
-        stopped
     }
 }
 """
@@ -206,7 +201,6 @@ def _inline_code_evaluator_input(
     *,
     name: str,
     sandbox_config_gid: str,
-    session_id: Optional[str],
 ) -> dict[str, Any]:
     inline: dict[str, Any] = {
         "name": name,
@@ -224,8 +218,6 @@ def _inline_code_evaluator_input(
         ],
         "sandboxConfigId": sandbox_config_gid,
     }
-    if session_id is not None:
-        inline["sessionId"] = session_id
     return {
         "previews": [
             {
@@ -243,8 +235,23 @@ def _config_global_id(config_id: int) -> str:
     return str(GlobalID("SandboxConfig", str(config_id)))
 
 
+def _expected_composed_key(*, cfg_gid: str, language: str = "PYTHON") -> str:
+    """Mirrors the server-side inline-session key derivation from
+    ``chat_mutations.py`` plus the manager's ``_composite_key`` suffix.
+
+    The mutation derives ``f"inline:{user_id or 'anon'}:{config_gid}:{language}"``
+    from the caller's auth context and the request's ``(config, language)``.
+    Tests run through ``gql_client`` unauthenticated, so ``user_id`` is None
+    and the sentinel ``"anon"`` is used. The manager then appends
+    ``"#" + backend.config_fingerprint()`` (here ``"#fake"``) for its
+    internal ``_tracked`` map and propagates the composite to
+    ``find_or_create_session`` / ``close_session``.
+    """
+    return f"inline:anon:{cfg_gid}:{language}#fake"
+
+
 class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
-    """Two ``evaluatorPreviews`` calls for the same inline ``sessionId``
+    """Two ``evaluatorPreviews`` calls deriving the same inline session key
     converge on a single remote sandbox handle even though every request
     builds a fresh backend wrapper.
     """
@@ -259,12 +266,7 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
         adapter = _FakeAdapter(backend_type=backend_type)
         cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
         cfg_gid = _config_global_id(cfg_id)
-        session_id = "stable-session-uuid-1111"
-        # Mirrors SandboxSessionManager._composite_key — the manager appends
-        # the backend's config_fingerprint to the logical session_key for its
-        # internal _tracked map and propagates the composite to
-        # find_or_create_session / close_session.
-        composed_key = f"inline:{session_id}#fake"
+        composed_key = _expected_composed_key(cfg_gid=cfg_gid)
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
             first = await gql_client.execute(
@@ -273,7 +275,6 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
                     "input": _inline_code_evaluator_input(
                         name="my_eval",
                         sandbox_config_gid=cfg_gid,
-                        session_id=session_id,
                     )
                 },
             )
@@ -285,7 +286,6 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
                     "input": _inline_code_evaluator_input(
                         name="my_eval",
                         sandbox_config_gid=cfg_gid,
-                        session_id=session_id,
                     )
                 },
             )
@@ -324,19 +324,16 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
         gql_client: AsyncGraphQLClient,
     ) -> None:
         """Q3 regression — a rename mid-iteration must not fragment the
-        session as long as the stable ``sessionId`` is unchanged.
+        session. Under the server-derived key, ``name`` is not part of the
+        derivation at all (the key is ``(user_id, config_gid, language)``),
+        so two renames produce the same session_key by construction.
         """
         _reset_fake_provider_state()
         backend_type = "SESSION_REUSE_FAKE_B"
         adapter = _FakeAdapter(backend_type=backend_type)
         cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
         cfg_gid = _config_global_id(cfg_id)
-        session_id = "stable-session-uuid-2222"
-        # Mirrors SandboxSessionManager._composite_key — the manager appends
-        # the backend's config_fingerprint to the logical session_key for its
-        # internal _tracked map and propagates the composite to
-        # find_or_create_session / close_session.
-        composed_key = f"inline:{session_id}#fake"
+        composed_key = _expected_composed_key(cfg_gid=cfg_gid)
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
             first = await gql_client.execute(
@@ -345,7 +342,6 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
                     "input": _inline_code_evaluator_input(
                         name="original_name",
                         sandbox_config_gid=cfg_gid,
-                        session_id=session_id,
                     )
                 },
             )
@@ -357,7 +353,6 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
                     "input": _inline_code_evaluator_input(
                         name="renamed_eval",
                         sandbox_config_gid=cfg_gid,
-                        session_id=session_id,
                     )
                 },
             )
@@ -371,119 +366,68 @@ class TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers:
         assert _FAKE_FIND_CALLS[0][1] == composed_key
 
 
-class TestStopEvaluatorSessionEvictsByComposedKey:
-    """``stopEvaluatorSession(sessionId)`` evicts the ``inline:<id>`` key
-    and only that key.
+class TestInlineSessionKeyPartitioning:
+    """The inline session key partitions on ``(user_id, config_gid, language)``.
+    Same triple → same session (reuse). Different triple → distinct sessions.
+
+    The reuse-on-same-triple case is covered by
+    ``TestEvaluatorPreviewsSessionReuseConvergesAcrossWrappers``. The
+    distinct-on-different-config case below guards the partitioning
+    invariant: two different sandbox configs must never share a session
+    even within a single caller's session graph.
     """
 
-    async def test_stop_evicts_matching_key(
+    async def test_distinct_configs_produce_distinct_sessions(
         self,
         db: DbSessionFactory,
         gql_client: AsyncGraphQLClient,
     ) -> None:
-        _reset_fake_provider_state()
-        backend_type = "SESSION_REUSE_FAKE_C"
-        adapter = _FakeAdapter(backend_type=backend_type)
-        cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
-        cfg_gid = _config_global_id(cfg_id)
-        session_id = "session-to-evict-3333"
-        # Mirrors SandboxSessionManager._composite_key — the manager appends
-        # the backend's config_fingerprint to the logical session_key for its
-        # internal _tracked map and propagates the composite to
-        # find_or_create_session / close_session.
-        composed_key = f"inline:{session_id}#fake"
-
-        with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
-            preview = await gql_client.execute(
-                _EVALUATOR_PREVIEWS,
-                variables={
-                    "input": _inline_code_evaluator_input(
-                        name="to_stop",
-                        sandbox_config_gid=cfg_gid,
-                        session_id=session_id,
-                    )
-                },
-            )
-            assert preview.data and not preview.errors, preview.errors
-            assert composed_key in _FAKE_PROVIDER_SESSIONS
-            assert _FAKE_CLOSE_CALLS == []
-
-            stop = await gql_client.execute(
-                _STOP_EVALUATOR_SESSION,
-                variables={"sessionId": session_id},
-            )
-            assert stop.data and not stop.errors, stop.errors
-            payload = stop.data["stopEvaluatorSession"]
-            assert payload["sessionId"] == session_id
-            assert payload["stopped"] is True
-
-        # close_session fired exactly once with the composed key.
-        assert len(_FAKE_CLOSE_CALLS) == 1
-        assert _FAKE_CLOSE_CALLS[0][1] == composed_key
-        assert composed_key not in _FAKE_PROVIDER_SESSIONS
-
-    async def test_stop_unknown_session_id_is_noop(
-        self,
-        db: DbSessionFactory,
-        gql_client: AsyncGraphQLClient,
-    ) -> None:
-        """A stop for an unknown session_id must still succeed (the manager
-        no-ops on absent keys).
-        """
-        _reset_fake_provider_state()
-        result = await gql_client.execute(
-            _STOP_EVALUATOR_SESSION,
-            variables={"sessionId": "no-such-session-9999"},
-        )
-        assert result.data and not result.errors, result.errors
-        payload = result.data["stopEvaluatorSession"]
-        assert payload["sessionId"] == "no-such-session-9999"
-        assert payload["stopped"] is True
-        assert _FAKE_CLOSE_CALLS == []
-
-    async def test_stop_does_not_evict_unrelated_keys(
-        self,
-        db: DbSessionFactory,
-        gql_client: AsyncGraphQLClient,
-    ) -> None:
-        """Two distinct session_ids produce two distinct tracked entries;
-        stopping one must not evict the other.
-        """
         _reset_fake_provider_state()
         backend_type = "SESSION_REUSE_FAKE_D"
         adapter = _FakeAdapter(backend_type=backend_type)
-        cfg_id = await _seed_provider_and_config(db, backend_type=backend_type)
-        cfg_gid = _config_global_id(cfg_id)
-        session_id_a = "session-keep-A"
-        session_id_b = "session-evict-B"
-        composed_a = f"inline:{session_id_a}#fake"
-        composed_b = f"inline:{session_id_b}#fake"
+        # One provider, two configs against it — the SandboxProvider table's
+        # UNIQUE (backend_type, language) constraint forbids two providers
+        # with the same backend_type, but multiple configs under one provider
+        # is exactly the multi-config-per-backend case we want to partition.
+        cfg_id_a = await _seed_provider_and_config(db, backend_type=backend_type)
+        async with db() as session:
+            existing = await session.get(models.SandboxConfig, cfg_id_a)
+            assert existing is not None
+            cfg_b = models.SandboxConfig(
+                sandbox_provider_id=existing.sandbox_provider_id,
+                language="PYTHON",
+                name=f"session-reuse-cfg-{backend_type.lower()}-b",
+                config={},
+                timeout=30,
+            )
+            session.add(cfg_b)
+            await session.flush()
+            cfg_id_b = int(cfg_b.id)
+        assert cfg_id_a != cfg_id_b
+        cfg_gid_a = _config_global_id(cfg_id_a)
+        cfg_gid_b = _config_global_id(cfg_id_b)
+        composed_a = _expected_composed_key(cfg_gid=cfg_gid_a)
+        composed_b = _expected_composed_key(cfg_gid=cfg_gid_b)
+        assert composed_a != composed_b
 
         with patch.dict(_SANDBOX_ADAPTERS, {backend_type: adapter}):
-            for sid in (session_id_a, session_id_b):
+            for cfg_gid in (cfg_gid_a, cfg_gid_b):
                 r = await gql_client.execute(
                     _EVALUATOR_PREVIEWS,
                     variables={
                         "input": _inline_code_evaluator_input(
                             name="ev",
                             sandbox_config_gid=cfg_gid,
-                            session_id=sid,
                         )
                     },
                 )
                 assert r.data and not r.errors, r.errors
 
-            assert composed_a in _FAKE_PROVIDER_SESSIONS
-            assert composed_b in _FAKE_PROVIDER_SESSIONS
-
-            stop = await gql_client.execute(
-                _STOP_EVALUATOR_SESSION,
-                variables={"sessionId": session_id_b},
-            )
-            assert stop.data and not stop.errors, stop.errors
-
-        # Only B was closed; A is still bound.
-        evicted_keys = [k for _, k in _FAKE_CLOSE_CALLS]
-        assert evicted_keys == [composed_b]
+        # Distinct configs → distinct tracked entries → two find_or_create_session
+        # calls, one per derived key.
         assert composed_a in _FAKE_PROVIDER_SESSIONS
-        assert composed_b not in _FAKE_PROVIDER_SESSIONS
+        assert composed_b in _FAKE_PROVIDER_SESSIONS
+        find_keys = sorted(k for _, k in _FAKE_FIND_CALLS)
+        assert find_keys == sorted([composed_a, composed_b]), (
+            f"Expected one find per derived key; got {_FAKE_FIND_CALLS!r}"
+        )

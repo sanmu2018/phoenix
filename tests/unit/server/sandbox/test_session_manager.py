@@ -928,9 +928,10 @@ async def test_evict_for_session_key_drains_every_composite_under_logical_key() 
     composite key prefix matches ``"k#"``, so a single logical-key eviction
     drains all config-variants under that key.
 
-    This matches the documented ``stopEvaluatorSession`` contract: the
-    frontend passes a logical session id and expects every backend session
-    bound to it to stop, regardless of mid-iteration config drift.
+    This is the invariant the timeout-teardown path relies on through
+    ``schedule_eviction``: callers pass a logical session key and expect
+    every backend session bound to it to stop, regardless of mid-iteration
+    config drift.
     """
 
     class _BackendCfgA(_FakeBackend):
