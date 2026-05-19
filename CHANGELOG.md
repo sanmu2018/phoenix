@@ -1,5 +1,13 @@
 # Changelog
 
+## [15.10.2](https://github.com/Arize-ai/phoenix/compare/arize-phoenix-v15.10.1...arize-phoenix-v15.10.2) (2026-05-19)
+
+
+### Bug Fixes
+
+* **devops:** tolerate missing pnpm-lock.yaml in oidc-server build and dev-mock-llm ([#13315](https://github.com/Arize-ai/phoenix/issues/13315)) ([4332255](https://github.com/Arize-ai/phoenix/commit/43322553920f42993ecf5302cf7cb8ab37f9bf8d))
+* **server:** handle empty header values in custom provider config ([#13311](https://github.com/Arize-ai/phoenix/issues/13311)) ([a329946](https://github.com/Arize-ai/phoenix/commit/a3299461accfcdf66bf983d95bc2cf0bd3229170))
+
 ## [15.10.1](https://github.com/Arize-ai/phoenix/compare/arize-phoenix-v15.10.0...arize-phoenix-v15.10.1) (2026-05-18)
 
 
