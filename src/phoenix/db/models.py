@@ -797,8 +797,17 @@ class Span(HasId):
 
     # TODO(mikeldking): is computed columns possible here
     cumulative_error_count: Mapped[int]
+    cumulative_llm_token_count_total: Mapped[int] = mapped_column(default=0)
     cumulative_llm_token_count_prompt: Mapped[int]
     cumulative_llm_token_count_completion: Mapped[int]
+    cumulative_llm_token_count_prompt_details_cache_read: Mapped[int] = mapped_column(default=0)
+    cumulative_llm_token_count_prompt_details_cache_write: Mapped[int] = mapped_column(default=0)
+    cumulative_llm_token_count_prompt_details_audio: Mapped[int] = mapped_column(default=0)
+    cumulative_llm_token_count_completion_details_reasoning: Mapped[int] = mapped_column(
+        default=0
+    )
+    cumulative_llm_token_count_completion_details_audio: Mapped[int] = mapped_column(default=0)
+    llm_token_count_total: Mapped[Optional[int]]
     llm_token_count_prompt: Mapped[Optional[int]]
     llm_token_count_completion: Mapped[Optional[int]]
 
@@ -901,27 +910,6 @@ class Span(HasId):
     def _num_documents_expression(cls) -> ColumnElement[int]:
         return NumDocuments(cls.attributes, cls.span_kind)
 
-    @hybrid_property
-    def cumulative_llm_token_count_total(self) -> int:
-        return self.cumulative_llm_token_count_prompt + self.cumulative_llm_token_count_completion
-
-    @cumulative_llm_token_count_total.inplace.expression
-    @classmethod
-    def _cumulative_llm_token_count_total_expression(cls) -> ColumnElement[int]:
-        return cls.cumulative_llm_token_count_prompt + cls.cumulative_llm_token_count_completion
-
-    @hybrid_property
-    def llm_token_count_total(self) -> int:
-        return (self.llm_token_count_prompt or 0) + (self.llm_token_count_completion or 0)
-
-    @llm_token_count_total.inplace.expression
-    @classmethod
-    def _llm_token_count_total_expression(cls) -> ColumnElement[int]:
-        return coalesce(
-            coalesce(cls.llm_token_count_prompt, 0) + coalesce(cls.llm_token_count_completion, 0),
-            0,
-        )
-
     trace: Mapped["Trace"] = relationship("Trace", back_populates="spans")
     span_annotations: Mapped[list["SpanAnnotation"]] = relationship(back_populates="span")
     document_annotations: Mapped[list["DocumentAnnotation"]] = relationship(back_populates="span")
@@ -936,7 +924,7 @@ class Span(HasId):
         Index("ix_latency", text("(end_time - start_time)")),
         Index(
             "ix_cumulative_llm_token_count_total",
-            text("(cumulative_llm_token_count_prompt + cumulative_llm_token_count_completion)"),
+            text("cumulative_llm_token_count_total"),
         ),
         Index(
             "ix_spans_session_id",

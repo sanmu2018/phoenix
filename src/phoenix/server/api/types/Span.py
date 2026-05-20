@@ -45,7 +45,9 @@ from phoenix.server.api.types.SpanCostDetailSummaryEntry import SpanCostDetailSu
 from phoenix.server.api.types.SpanCostSummary import SpanCostSummary
 from phoenix.server.api.types.SpanIOValue import SpanIOValue, truncate_value
 from phoenix.trace.attributes import get_attribute_value
+from phoenix.trace.token_counts import get_llm_token_counts
 
+from .TokenCountCompletionDetails import TokenCountCompletionDetails
 from .TokenCountPromptDetails import TokenCountPromptDetails
 
 if TYPE_CHECKING:
@@ -328,7 +330,11 @@ class Span(Node):
         info: Info[Context, None],
     ) -> Optional[int]:
         if self.db_record:
-            return self.db_record.llm_token_count_total
+            if self.db_record.llm_token_count_total is not None:
+                return self.db_record.llm_token_count_total
+            return (self.db_record.llm_token_count_prompt or 0) + (
+                self.db_record.llm_token_count_completion or 0
+            )
         value = await info.context.data_loaders.span_fields.load(
             (self.id, models.Span.llm_token_count_total),
         )
@@ -370,34 +376,30 @@ class Span(Node):
                 (self.id, models.Span.attributes),
             )
 
-        cache_read: Optional[int] = None
-        raw_cache_read = get_attribute_value(
-            attributes=attributes,
-            key=LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ,
-        )
-        if isinstance(raw_cache_read, int):
-            cache_read = raw_cache_read
-
-        cache_write: Optional[int] = None
-        raw_cache_write = get_attribute_value(
-            attributes=attributes,
-            key=LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE,
-        )
-        if isinstance(raw_cache_write, int):
-            cache_write = raw_cache_write
-
-        audio: Optional[int] = None
-        raw_audio = get_attribute_value(
-            attributes=attributes,
-            key=LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO,
-        )
-        if isinstance(raw_audio, int):
-            audio = raw_audio
+        token_counts = get_llm_token_counts(attributes)
 
         return TokenCountPromptDetails(
-            cache_read=cache_read,
-            cache_write=cache_write,
-            audio=audio,
+            cache_read=token_counts.prompt_details_cache_read,
+            cache_write=token_counts.prompt_details_cache_write,
+            audio=token_counts.prompt_details_audio,
+        )
+
+    @strawberry.field
+    async def token_completion_details(
+        self,
+        info: Info[Context, None],
+    ) -> TokenCountCompletionDetails:
+        if self.db_record:
+            attributes = self.db_record.attributes
+        else:
+            attributes = await info.context.data_loaders.span_fields.load(
+                (self.id, models.Span.attributes),
+            )
+
+        token_counts = get_llm_token_counts(attributes)
+        return TokenCountCompletionDetails(
+            reasoning=token_counts.completion_details_reasoning,
+            audio=token_counts.completion_details_audio,
         )
 
     @strawberry.field
@@ -485,7 +487,13 @@ class Span(Node):
         info: Info[Context, None],
     ) -> Optional[float]:
         if self.db_record:
-            return float(self.db_record.cumulative_llm_token_count_total)
+            total = self.db_record.cumulative_llm_token_count_total
+            if not total:
+                total = (
+                    self.db_record.cumulative_llm_token_count_prompt
+                    + self.db_record.cumulative_llm_token_count_completion
+                )
+            return float(total)
         value = await info.context.data_loaders.span_fields.load(
             (self.id, models.Span.cumulative_llm_token_count_total),
         )
@@ -520,6 +528,55 @@ class Span(Node):
             (self.id, models.Span.cumulative_llm_token_count_completion),
         )
         return float(value) if value is not None else None
+
+    @strawberry.field
+    async def cumulative_token_prompt_details(
+        self,
+        info: Info[Context, None],
+    ) -> TokenCountPromptDetails:
+        if self.db_record:
+            return TokenCountPromptDetails(
+                cache_read=self.db_record.cumulative_llm_token_count_prompt_details_cache_read,
+                cache_write=self.db_record.cumulative_llm_token_count_prompt_details_cache_write,
+                audio=self.db_record.cumulative_llm_token_count_prompt_details_audio,
+            )
+        cache_read, cache_write, audio = await gather(
+            info.context.data_loaders.span_fields.load(
+                (self.id, models.Span.cumulative_llm_token_count_prompt_details_cache_read),
+            ),
+            info.context.data_loaders.span_fields.load(
+                (self.id, models.Span.cumulative_llm_token_count_prompt_details_cache_write),
+            ),
+            info.context.data_loaders.span_fields.load(
+                (self.id, models.Span.cumulative_llm_token_count_prompt_details_audio),
+            ),
+        )
+        return TokenCountPromptDetails(cache_read=cache_read, cache_write=cache_write, audio=audio)
+
+    @strawberry.field
+    async def cumulative_token_completion_details(
+        self,
+        info: Info[Context, None],
+    ) -> TokenCountCompletionDetails:
+        if self.db_record:
+            return TokenCountCompletionDetails(
+                reasoning=(
+                    self.db_record.cumulative_llm_token_count_completion_details_reasoning
+                ),
+                audio=self.db_record.cumulative_llm_token_count_completion_details_audio,
+            )
+        reasoning, audio = await gather(
+            info.context.data_loaders.span_fields.load(
+                (
+                    self.id,
+                    models.Span.cumulative_llm_token_count_completion_details_reasoning,
+                ),
+            ),
+            info.context.data_loaders.span_fields.load(
+                (self.id, models.Span.cumulative_llm_token_count_completion_details_audio),
+            ),
+        )
+        return TokenCountCompletionDetails(reasoning=reasoning, audio=audio)
 
     @strawberry.field(
         description="Propagated status code that percolates up error status codes from "
@@ -856,11 +913,6 @@ def _convert_metadata_to_string(metadata: Any) -> Optional[str]:
 
 INPUT_MIME_TYPE = SpanAttributes.INPUT_MIME_TYPE
 INPUT_VALUE = SpanAttributes.INPUT_VALUE
-LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO = SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO
-LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ = SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ
-LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE = (
-    SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE
-)
 METADATA = SpanAttributes.METADATA
 OUTPUT_MIME_TYPE = SpanAttributes.OUTPUT_MIME_TYPE
 OUTPUT_VALUE = SpanAttributes.OUTPUT_VALUE

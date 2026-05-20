@@ -18,6 +18,10 @@ export type SpanTokenCountDetailsQuery$data = {
     readonly tokenCountCompletion: number | null;
     readonly tokenCountPrompt: number | null;
     readonly tokenCountTotal: number | null;
+    readonly tokenCompletionDetails: {
+      readonly audio: number | null;
+      readonly reasoning: number | null;
+    };
     readonly tokenPromptDetails: {
       readonly audio: number | null;
       readonly cacheRead: number | null;
@@ -111,6 +115,31 @@ v3 = {
         }
       ],
       "storageKey": null
+    },
+    {
+      "alias": null,
+      "args": null,
+      "concreteType": "TokenCountCompletionDetails",
+      "kind": "LinkedField",
+      "name": "tokenCompletionDetails",
+      "plural": false,
+      "selections": [
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "reasoning",
+          "storageKey": null
+        },
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "audio",
+          "storageKey": null
+        }
+      ],
+      "storageKey": null
     }
   ],
   "type": "Span",
@@ -174,7 +203,7 @@ return {
     "metadata": {},
     "name": "SpanTokenCountDetailsQuery",
     "operationKind": "query",
-    "text": "query SpanTokenCountDetailsQuery(\n  $nodeId: ID!\n) {\n  node(id: $nodeId) {\n    __typename\n    ... on Span {\n      tokenCountTotal\n      tokenCountPrompt\n      tokenCountCompletion\n      tokenPromptDetails {\n        audio\n        cacheRead\n        cacheWrite\n      }\n    }\n    id\n  }\n}\n"
+    "text": "query SpanTokenCountDetailsQuery(\n  $nodeId: ID!\n) {\n  node(id: $nodeId) {\n    __typename\n    ... on Span {\n      tokenCountTotal\n      tokenCountPrompt\n      tokenCountCompletion\n      tokenPromptDetails {\n        audio\n        cacheRead\n        cacheWrite\n      }\n      tokenCompletionDetails {\n        reasoning\n        audio\n      }\n    }\n    id\n  }\n}\n"
   }
 };
 })();

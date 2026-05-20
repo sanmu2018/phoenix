@@ -16,7 +16,7 @@
   </pairing_condition_with_root_spans_only>
   <dsl_reference>
     - String fields: `span_kind`, `name` (the span name, NOT span_name), `status_code`, `status_message`, `span_id`, `trace_id`, `parent_id`. Compare with `==`, `!=`, or membership via `in`.
-    - Numeric fields: `latency_ms`, `cumulative_token_count.{prompt,completion,total}`, `llm.token_count.{prompt,completion,total}`. Compare with `<`, `<=`, `>`, `>=`.
+    - Numeric fields: `latency_ms`, `cumulative_token_count.{prompt,completion,total}`, `cumulative_token_count.prompt_details.{cache_read,cache_write,audio}`, `cumulative_token_count.completion_details.{reasoning,audio}`, `llm.token_count.{prompt,completion,total}`. Compare with `<`, `<=`, `>`, `>=`.
     - Datetime fields: `start_time`, `end_time`.
     - Attribute access: `attributes['key.path']`, `input.value`, `output.value`, `metadata['key']`.
     - Annotations: `annotations['Name'].label`, `annotations['Name'].score`.

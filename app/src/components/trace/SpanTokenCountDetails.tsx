@@ -19,6 +19,10 @@ export function SpanTokenCountDetails(props: { spanNodeId: string }) {
               cacheRead
               cacheWrite
             }
+            tokenCompletionDetails {
+              reasoning
+              audio
+            }
           }
         }
       }
@@ -32,6 +36,7 @@ export function SpanTokenCountDetails(props: { spanNodeId: string }) {
       const completion = data.node.tokenCountCompletion ?? 0;
       const total = data.node.tokenCountTotal ?? 0;
       const promptDetails: Record<string, number> = {};
+      const completionDetails: Record<string, number> = {};
 
       // Add available prompt details
       if (data.node.tokenPromptDetails?.audio) {
@@ -43,6 +48,12 @@ export function SpanTokenCountDetails(props: { spanNodeId: string }) {
       if (data.node.tokenPromptDetails?.cacheWrite) {
         promptDetails["cache write"] = data.node.tokenPromptDetails.cacheWrite;
       }
+      if (data.node.tokenCompletionDetails?.reasoning) {
+        completionDetails.reasoning = data.node.tokenCompletionDetails.reasoning;
+      }
+      if (data.node.tokenCompletionDetails?.audio) {
+        completionDetails.audio = data.node.tokenCompletionDetails.audio;
+      }
 
       return {
         total,
@@ -50,6 +61,10 @@ export function SpanTokenCountDetails(props: { spanNodeId: string }) {
         completion,
         promptDetails:
           Object.keys(promptDetails).length > 0 ? promptDetails : undefined,
+        completionDetails:
+          Object.keys(completionDetails).length > 0
+            ? completionDetails
+            : undefined,
       };
     }
 

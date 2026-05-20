@@ -98,11 +98,12 @@ class GetTracesResponseBody(PaginatedResponseBody[TraceData]):
 def _to_trace_data(
     trace: models.Trace,
     project_id: int,
-    token_counts: Optional[tuple[int, int]] = None,
+    token_counts: Optional[tuple[int, int, int]] = None,
     spans: Optional[list[TraceSpanData]] = None,
 ) -> TraceData:
     prompt = token_counts[0] if token_counts is not None else 0
     completion = token_counts[1] if token_counts is not None else 0
+    total = token_counts[2] if token_counts is not None else prompt + completion
     return TraceData(
         id=str(GlobalID(TraceNodeType.__name__, str(trace.id))),
         trace_id=trace.trace_id,
@@ -111,7 +112,7 @@ def _to_trace_data(
         end_time=trace.end_time,
         token_count_prompt=prompt,
         token_count_completion=completion,
-        token_count_total=prompt + completion,
+        token_count_total=total,
         spans=spans,
     )
 
@@ -234,9 +235,9 @@ async def list_project_traces(
         trace_rowids = [t.id for t in traces]
 
         # Batch-fetch cumulative token counts (one query per page, not per row)
-        token_counts_by_trace: dict[int, tuple[int, int]] = {}
+        token_counts_by_trace: dict[int, tuple[int, int, int]] = {}
         for row in (await session.execute(cumulative_token_counts_by_trace(trace_rowids))).all():
-            token_counts_by_trace[row.id_] = (row.prompt, row.completion)
+            token_counts_by_trace[row.id_] = (row.prompt, row.completion, row.total)
 
         # Optionally batch-fetch full span details (column projection to avoid
         # loading heavy attributes/events JSON blobs that aren't in the response)

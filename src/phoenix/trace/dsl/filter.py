@@ -112,7 +112,22 @@ _FLOAT_NAMES: typing.Mapping[str, sqlalchemy.SQLColumnExpression[typing.Any]] = 
     {
         "latency_ms": models.Span.latency_ms,
         "cumulative_llm_token_count_completion": models.Span.cumulative_llm_token_count_completion,
+        "cumulative_llm_token_count_completion_details_audio": (
+            models.Span.cumulative_llm_token_count_completion_details_audio
+        ),
+        "cumulative_llm_token_count_completion_details_reasoning": (
+            models.Span.cumulative_llm_token_count_completion_details_reasoning
+        ),
         "cumulative_llm_token_count_prompt": models.Span.cumulative_llm_token_count_prompt,
+        "cumulative_llm_token_count_prompt_details_audio": (
+            models.Span.cumulative_llm_token_count_prompt_details_audio
+        ),
+        "cumulative_llm_token_count_prompt_details_cache_read": (
+            models.Span.cumulative_llm_token_count_prompt_details_cache_read
+        ),
+        "cumulative_llm_token_count_prompt_details_cache_write": (
+            models.Span.cumulative_llm_token_count_prompt_details_cache_write
+        ),
         "cumulative_llm_token_count_total": models.Span.cumulative_llm_token_count_total,
     }
 )
@@ -137,7 +152,22 @@ _BACKWARD_COMPATIBILITY_REPLACEMENTS: typing.Mapping[str, str] = MappingProxyTyp
         "context.span_id": "span_id",
         "context.trace_id": "trace_id",
         "cumulative_token_count.completion": "cumulative_llm_token_count_completion",
+        "cumulative_token_count.completion_details.audio": (
+            "cumulative_llm_token_count_completion_details_audio"
+        ),
+        "cumulative_token_count.completion_details.reasoning": (
+            "cumulative_llm_token_count_completion_details_reasoning"
+        ),
         "cumulative_token_count.prompt": "cumulative_llm_token_count_prompt",
+        "cumulative_token_count.prompt_details.audio": (
+            "cumulative_llm_token_count_prompt_details_audio"
+        ),
+        "cumulative_token_count.prompt_details.cache_read": (
+            "cumulative_llm_token_count_prompt_details_cache_read"
+        ),
+        "cumulative_token_count.prompt_details.cache_write": (
+            "cumulative_llm_token_count_prompt_details_cache_write"
+        ),
         "cumulative_token_count.total": "cumulative_llm_token_count_total",
     }
 )

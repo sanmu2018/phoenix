@@ -150,6 +150,12 @@ class ProjectSession(Node):
         return TokenUsage(
             prompt=usage.prompt,
             completion=usage.completion,
+            total=usage.total or usage.prompt + usage.completion,
+            cache_read=usage.cache_read,
+            cache_write=usage.cache_write,
+            prompt_audio=usage.prompt_audio,
+            reasoning=usage.reasoning,
+            completion_audio=usage.completion_audio,
         )
 
     @strawberry.field(extensions=[RequireForwardPaginationExtension()])  # type: ignore[untyped-decorator]

@@ -42,15 +42,20 @@ class SpanColumn(Enum):
         elif self is SpanColumn.latencyMs:
             expr = models.Span.latency_ms
         elif self is SpanColumn.tokenCountTotal:
-            expr = models.Span.llm_token_count_total
+            expr = func.coalesce(
+                models.Span.llm_token_count_total,
+                func.coalesce(models.Span.llm_token_count_prompt, 0)
+                + func.coalesce(models.Span.llm_token_count_completion, 0),
+            )
         elif self is SpanColumn.tokenCountPrompt:
             expr = models.Span.llm_token_count_prompt
         elif self is SpanColumn.tokenCountCompletion:
             expr = models.Span.llm_token_count_completion
         elif self is SpanColumn.cumulativeTokenCountTotal:
-            expr = (
+            expr = func.coalesce(
+                func.nullif(models.Span.cumulative_llm_token_count_total, 0),
                 models.Span.cumulative_llm_token_count_prompt
-                + models.Span.cumulative_llm_token_count_completion
+                + models.Span.cumulative_llm_token_count_completion,
             )
         elif self is SpanColumn.cumulativeTokenCountPrompt:
             expr = models.Span.cumulative_llm_token_count_prompt

@@ -20,8 +20,27 @@ class SessionTokenUsagesDataLoader(DataLoader[Key, Result]):
         stmt = cumulative_token_counts_by_session(keys)
         async with self._db.read() as session:
             result: dict[Key, TokenUsage] = {
-                id_: TokenUsage(prompt=prompt, completion=completion)
-                async for id_, prompt, completion in await session.stream(stmt)
+                id_: TokenUsage(
+                    prompt=prompt,
+                    completion=completion,
+                    total=total,
+                    cache_read=cache_read,
+                    cache_write=cache_write,
+                    prompt_audio=prompt_audio,
+                    reasoning=reasoning,
+                    completion_audio=completion_audio,
+                )
+                async for (
+                    id_,
+                    prompt,
+                    completion,
+                    total,
+                    cache_read,
+                    cache_write,
+                    prompt_audio,
+                    reasoning,
+                    completion_audio,
+                ) in await session.stream(stmt)
                 if id_ is not None
             }
         return [result.get(key, TokenUsage()) for key in keys]

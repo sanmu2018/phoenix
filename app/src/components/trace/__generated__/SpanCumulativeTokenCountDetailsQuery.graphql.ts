@@ -18,6 +18,15 @@ export type SpanCumulativeTokenCountDetailsQuery$data = {
     readonly cumulativeTokenCountCompletion: number | null;
     readonly cumulativeTokenCountPrompt: number | null;
     readonly cumulativeTokenCountTotal: number | null;
+    readonly cumulativeTokenCompletionDetails: {
+      readonly audio: number | null;
+      readonly reasoning: number | null;
+    };
+    readonly cumulativeTokenPromptDetails: {
+      readonly audio: number | null;
+      readonly cacheRead: number | null;
+      readonly cacheWrite: number | null;
+    };
   } | {
     // This will never be '%other', but we need some
     // value in case none of the concrete values match.
@@ -73,6 +82,63 @@ v3 = {
       "args": null,
       "kind": "ScalarField",
       "name": "cumulativeTokenCountCompletion",
+      "storageKey": null
+    },
+    {
+      "alias": null,
+      "args": null,
+      "concreteType": "TokenCountPromptDetails",
+      "kind": "LinkedField",
+      "name": "cumulativeTokenPromptDetails",
+      "plural": false,
+      "selections": [
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "audio",
+          "storageKey": null
+        },
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "cacheRead",
+          "storageKey": null
+        },
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "cacheWrite",
+          "storageKey": null
+        }
+      ],
+      "storageKey": null
+    },
+    {
+      "alias": null,
+      "args": null,
+      "concreteType": "TokenCountCompletionDetails",
+      "kind": "LinkedField",
+      "name": "cumulativeTokenCompletionDetails",
+      "plural": false,
+      "selections": [
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "reasoning",
+          "storageKey": null
+        },
+        {
+          "alias": null,
+          "args": null,
+          "kind": "ScalarField",
+          "name": "audio",
+          "storageKey": null
+        }
+      ],
       "storageKey": null
     }
   ],
@@ -137,7 +203,7 @@ return {
     "metadata": {},
     "name": "SpanCumulativeTokenCountDetailsQuery",
     "operationKind": "query",
-    "text": "query SpanCumulativeTokenCountDetailsQuery(\n  $nodeId: ID!\n) {\n  node(id: $nodeId) {\n    __typename\n    ... on Span {\n      cumulativeTokenCountTotal\n      cumulativeTokenCountPrompt\n      cumulativeTokenCountCompletion\n    }\n    id\n  }\n}\n"
+    "text": "query SpanCumulativeTokenCountDetailsQuery(\n  $nodeId: ID!\n) {\n  node(id: $nodeId) {\n    __typename\n    ... on Span {\n      cumulativeTokenCountTotal\n      cumulativeTokenCountPrompt\n      cumulativeTokenCountCompletion\n      cumulativeTokenPromptDetails {\n        audio\n        cacheRead\n        cacheWrite\n      }\n      cumulativeTokenCompletionDetails {\n        reasoning\n        audio\n      }\n    }\n    id\n  }\n}\n"
   }
 };
 })();

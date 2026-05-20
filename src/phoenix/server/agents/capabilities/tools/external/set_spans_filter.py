@@ -40,6 +40,8 @@ DESCRIPTION = (
     "Compare with `==`, `!=`, or membership via `in`.\n"
     "  - Numeric: `latency_ms`, "
     "`cumulative_token_count.{prompt,completion,total}`, "
+    "`cumulative_token_count.prompt_details.{cache_read,cache_write,audio}`, "
+    "`cumulative_token_count.completion_details.{reasoning,audio}`, "
     "`llm.token_count.{prompt,completion,total}`. Compare with `<`, "
     "`<=`, `>`, `>=`.\n"
     "  - Datetime: `start_time`, `end_time`.\n"

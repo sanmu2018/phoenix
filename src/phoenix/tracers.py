@@ -30,6 +30,7 @@ from phoenix.db.insertion.helpers import should_calculate_span_cost
 from phoenix.server.daemons.span_cost_calculator import SpanCostCalculator
 from phoenix.server.telemetry import normalize_http_collector_endpoint
 from phoenix.trace.attributes import get_attribute_value, load_json_strings, unflatten
+from phoenix.trace.token_counts import get_llm_token_counts
 
 logger = logging.getLogger(__name__)
 
@@ -211,8 +212,24 @@ class Tracer(wrapt.ObjectProxy):  # type: ignore[misc]
             db_span_costs = db_span_costs_by_trace_id[trace_id]
             for db_span, count in zip(db_spans, _get_cumulative_counts(db_spans)):
                 db_span.cumulative_error_count = count.errors
+                db_span.cumulative_llm_token_count_total = count.total_tokens
                 db_span.cumulative_llm_token_count_prompt = count.prompt_tokens
                 db_span.cumulative_llm_token_count_completion = count.completion_tokens
+                db_span.cumulative_llm_token_count_prompt_details_cache_read = (
+                    count.prompt_details_cache_read
+                )
+                db_span.cumulative_llm_token_count_prompt_details_cache_write = (
+                    count.prompt_details_cache_write
+                )
+                db_span.cumulative_llm_token_count_prompt_details_audio = (
+                    count.prompt_details_audio
+                )
+                db_span.cumulative_llm_token_count_completion_details_reasoning = (
+                    count.completion_details_reasoning
+                )
+                db_span.cumulative_llm_token_count_completion_details_audio = (
+                    count.completion_details_audio
+                )
             db_trace = _get_db_trace(
                 project_id=project_id,
                 trace_id=trace_id,
@@ -308,15 +325,7 @@ def _get_db_span(
         }
         events.append(event_dict)
 
-    llm_token_count_prompt = None
-    llm_token_count_completion = None
-    if span_kind == OpenInferenceSpanKindValues.LLM.value:
-        llm_token_count_prompt = get_attribute_value(
-            attributes, SpanAttributes.LLM_TOKEN_COUNT_PROMPT
-        )
-        llm_token_count_completion = get_attribute_value(
-            attributes, SpanAttributes.LLM_TOKEN_COUNT_COMPLETION
-        )
+    token_counts = get_llm_token_counts(attributes)
 
     return models.Span(
         span_id=span_id,
@@ -330,10 +339,25 @@ def _get_db_span(
         status_code=otel_span.status.status_code.name,
         status_message=otel_span.status.description or "",
         cumulative_error_count=0,  # cannot be computed until all spans are collected
+        cumulative_llm_token_count_total=0,  # cannot be computed until all spans are collected
         cumulative_llm_token_count_prompt=0,  # cannot be computed until all spans are collected
         cumulative_llm_token_count_completion=0,  # cannot be computed until all spans are collected
-        llm_token_count_prompt=llm_token_count_prompt,
-        llm_token_count_completion=llm_token_count_completion,
+        cumulative_llm_token_count_prompt_details_cache_read=(
+            token_counts.prompt_details_cache_read or 0
+        ),
+        cumulative_llm_token_count_prompt_details_cache_write=(
+            token_counts.prompt_details_cache_write or 0
+        ),
+        cumulative_llm_token_count_prompt_details_audio=token_counts.prompt_details_audio or 0,
+        cumulative_llm_token_count_completion_details_reasoning=(
+            token_counts.completion_details_reasoning or 0
+        ),
+        cumulative_llm_token_count_completion_details_audio=(
+            token_counts.completion_details_audio or 0
+        ),
+        llm_token_count_total=token_counts.total,
+        llm_token_count_prompt=token_counts.prompt,
+        llm_token_count_completion=token_counts.completion,
     )
 
 
@@ -354,8 +378,14 @@ def _get_db_span_cost(
 @dataclass
 class CumulativeCount:
     errors: int
+    total_tokens: int
     prompt_tokens: int
     completion_tokens: int
+    prompt_details_cache_read: int
+    prompt_details_cache_write: int
+    prompt_details_audio: int
+    completion_details_reasoning: int
+    completion_details_audio: int
 
 
 def _get_cumulative_counts(spans: Sequence[models.Span]) -> list[CumulativeCount]:
@@ -377,8 +407,22 @@ def _get_cumulative_counts(spans: Sequence[models.Span]) -> list[CumulativeCount
             parent_to_children_ids[span.parent_id].append(span.span_id)
         counts_by_span_id[span.span_id] = CumulativeCount(
             errors=int(span.status_code == "ERROR"),
+            total_tokens=span.llm_token_count_total or 0,
             prompt_tokens=span.llm_token_count_prompt or 0,
             completion_tokens=span.llm_token_count_completion or 0,
+            prompt_details_cache_read=(
+                span.cumulative_llm_token_count_prompt_details_cache_read or 0
+            ),
+            prompt_details_cache_write=(
+                span.cumulative_llm_token_count_prompt_details_cache_write or 0
+            ),
+            prompt_details_audio=span.cumulative_llm_token_count_prompt_details_audio or 0,
+            completion_details_reasoning=(
+                span.cumulative_llm_token_count_completion_details_reasoning or 0
+            ),
+            completion_details_audio=(
+                span.cumulative_llm_token_count_completion_details_audio or 0
+            ),
         )
 
     # iterative post-order traversal
@@ -396,7 +440,15 @@ def _get_cumulative_counts(spans: Sequence[models.Span]) -> list[CumulativeCount
                 for child_id in parent_to_children_ids.get(span_id, []):
                     child_counts = counts_by_span_id[child_id]
                     count.errors += child_counts.errors
+                    count.total_tokens += child_counts.total_tokens
                     count.prompt_tokens += child_counts.prompt_tokens
                     count.completion_tokens += child_counts.completion_tokens
+                    count.prompt_details_cache_read += child_counts.prompt_details_cache_read
+                    count.prompt_details_cache_write += child_counts.prompt_details_cache_write
+                    count.prompt_details_audio += child_counts.prompt_details_audio
+                    count.completion_details_reasoning += (
+                        child_counts.completion_details_reasoning
+                    )
+                    count.completion_details_audio += child_counts.completion_details_audio
 
     return [counts_by_span_id[span.span_id] for span in spans]

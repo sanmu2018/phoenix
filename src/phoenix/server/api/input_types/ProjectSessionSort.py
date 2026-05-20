@@ -64,7 +64,13 @@ class ProjectSessionColumn(Enum):
             sort_subq = (
                 select(
                     models.Trace.project_session_rowid.label("id"),
-                    func.sum(models.Span.cumulative_llm_token_count_total).label("key"),
+                    func.sum(
+                        func.coalesce(
+                            func.nullif(models.Span.cumulative_llm_token_count_total, 0),
+                            models.Span.cumulative_llm_token_count_prompt
+                            + models.Span.cumulative_llm_token_count_completion,
+                        )
+                    ).label("key"),
                 )
                 .join_from(models.Trace, models.Span)
                 .where(models.Span.parent_id.is_(None))

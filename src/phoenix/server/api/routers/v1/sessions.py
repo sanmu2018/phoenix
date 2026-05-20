@@ -182,9 +182,9 @@ def _to_trace_data(trace: models.Trace) -> SessionTraceData:
 def _to_session_data(
     project_session: models.ProjectSession,
     traces: list[models.Trace],
-    token_counts: dict[int, tuple[int, int]],
+    token_counts: dict[int, tuple[int, int, int]],
 ) -> SessionData:
-    prompt, completion = token_counts.get(project_session.id, (0, 0))
+    prompt, completion, total = token_counts.get(project_session.id, (0, 0, 0))
     return SessionData(
         id=str(GlobalID(ProjectSessionNodeType.__name__, str(project_session.id))),
         session_id=project_session.session_id,
@@ -194,7 +194,7 @@ def _to_session_data(
         traces=[_to_trace_data(t) for t in traces],
         token_count_prompt=prompt,
         token_count_completion=completion,
-        token_count_total=prompt + completion,
+        token_count_total=total,
     )
 
 
@@ -221,8 +221,8 @@ async def get_session(
         token_counts_rows = await db_session.execute(
             cumulative_token_counts_by_session([project_session.id])
         )
-        token_counts: dict[int, tuple[int, int]] = {
-            row.id_: (row.prompt, row.completion) for row in token_counts_rows
+        token_counts: dict[int, tuple[int, int, int]] = {
+            row.id_: (row.prompt, row.completion, row.total) for row in token_counts_rows
         }
     data = _to_session_data(project_session, traces, token_counts)
     return GetSessionResponseBody(data=data)
@@ -415,8 +415,8 @@ async def list_project_sessions(
         token_counts_rows = await db_session.execute(
             cumulative_token_counts_by_session(session_ids)
         )
-        token_counts: dict[int, tuple[int, int]] = {
-            row.id_: (row.prompt, row.completion) for row in token_counts_rows
+        token_counts: dict[int, tuple[int, int, int]] = {
+            row.id_: (row.prompt, row.completion, row.total) for row in token_counts_rows
         }
 
         data = [

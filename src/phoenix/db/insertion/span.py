@@ -1,14 +1,13 @@
 from dataclasses import asdict
 from typing import NamedTuple, Optional, cast
 
-from openinference.semconv.trace import SpanAttributes
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from phoenix.db import models
 from phoenix.db.helpers import SupportedSQLDialect
 from phoenix.db.insertion.helpers import OnConflict, insert_on_conflict
-from phoenix.trace.attributes import get_attribute_value
+from phoenix.trace.token_counts import get_llm_token_counts
 from phoenix.trace.schemas import Span, SpanStatusCode
 
 
@@ -104,42 +103,49 @@ async def insert_span(
     )
 
     cumulative_error_count = int(span.status_code is SpanStatusCode.ERROR)
-    try:
-        cumulative_llm_token_count_prompt = int(
-            get_attribute_value(span.attributes, SpanAttributes.LLM_TOKEN_COUNT_PROMPT) or 0
-        )
-    except BaseException:
-        cumulative_llm_token_count_prompt = 0
-    try:
-        cumulative_llm_token_count_completion = int(
-            get_attribute_value(span.attributes, SpanAttributes.LLM_TOKEN_COUNT_COMPLETION) or 0
-        )
-    except BaseException:
-        cumulative_llm_token_count_completion = 0
-    try:
-        llm_token_count_prompt = int(
-            get_attribute_value(span.attributes, SpanAttributes.LLM_TOKEN_COUNT_PROMPT) or 0
-        )
-    except BaseException:
-        llm_token_count_prompt = 0
-    try:
-        llm_token_count_completion = int(
-            get_attribute_value(span.attributes, SpanAttributes.LLM_TOKEN_COUNT_COMPLETION) or 0
-        )
-    except BaseException:
-        llm_token_count_completion = 0
+    token_counts = get_llm_token_counts(span.attributes)
+    cumulative_llm_token_count_total = token_counts.total or 0
+    cumulative_llm_token_count_prompt = token_counts.prompt or 0
+    cumulative_llm_token_count_completion = token_counts.completion or 0
+    cumulative_llm_token_count_prompt_details_cache_read = (
+        token_counts.prompt_details_cache_read or 0
+    )
+    cumulative_llm_token_count_prompt_details_cache_write = (
+        token_counts.prompt_details_cache_write or 0
+    )
+    cumulative_llm_token_count_prompt_details_audio = token_counts.prompt_details_audio or 0
+    cumulative_llm_token_count_completion_details_reasoning = (
+        token_counts.completion_details_reasoning or 0
+    )
+    cumulative_llm_token_count_completion_details_audio = (
+        token_counts.completion_details_audio or 0
+    )
     if accumulation := (
         await session.execute(
             select(
                 func.sum(models.Span.cumulative_error_count),
+                func.sum(models.Span.cumulative_llm_token_count_total),
                 func.sum(models.Span.cumulative_llm_token_count_prompt),
                 func.sum(models.Span.cumulative_llm_token_count_completion),
+                func.sum(models.Span.cumulative_llm_token_count_prompt_details_cache_read),
+                func.sum(models.Span.cumulative_llm_token_count_prompt_details_cache_write),
+                func.sum(models.Span.cumulative_llm_token_count_prompt_details_audio),
+                func.sum(models.Span.cumulative_llm_token_count_completion_details_reasoning),
+                func.sum(models.Span.cumulative_llm_token_count_completion_details_audio),
             ).where(models.Span.parent_id == span.context.span_id)
         )
     ).first():
         cumulative_error_count += cast(int, accumulation[0] or 0)
-        cumulative_llm_token_count_prompt += cast(int, accumulation[1] or 0)
-        cumulative_llm_token_count_completion += cast(int, accumulation[2] or 0)
+        cumulative_llm_token_count_total += cast(int, accumulation[1] or 0)
+        cumulative_llm_token_count_prompt += cast(int, accumulation[2] or 0)
+        cumulative_llm_token_count_completion += cast(int, accumulation[3] or 0)
+        cumulative_llm_token_count_prompt_details_cache_read += cast(int, accumulation[4] or 0)
+        cumulative_llm_token_count_prompt_details_cache_write += cast(int, accumulation[5] or 0)
+        cumulative_llm_token_count_prompt_details_audio += cast(int, accumulation[6] or 0)
+        cumulative_llm_token_count_completion_details_reasoning += cast(
+            int, accumulation[7] or 0
+        )
+        cumulative_llm_token_count_completion_details_audio += cast(int, accumulation[8] or 0)
     span_rowid = await session.scalar(
         insert_on_conflict(
             dict(
@@ -155,10 +161,27 @@ async def insert_span(
                 status_code=span.status_code.value,
                 status_message=span.status_message,
                 cumulative_error_count=cumulative_error_count,
+                cumulative_llm_token_count_total=cumulative_llm_token_count_total,
                 cumulative_llm_token_count_prompt=cumulative_llm_token_count_prompt,
                 cumulative_llm_token_count_completion=cumulative_llm_token_count_completion,
-                llm_token_count_prompt=llm_token_count_prompt,
-                llm_token_count_completion=llm_token_count_completion,
+                cumulative_llm_token_count_prompt_details_cache_read=(
+                    cumulative_llm_token_count_prompt_details_cache_read
+                ),
+                cumulative_llm_token_count_prompt_details_cache_write=(
+                    cumulative_llm_token_count_prompt_details_cache_write
+                ),
+                cumulative_llm_token_count_prompt_details_audio=(
+                    cumulative_llm_token_count_prompt_details_audio
+                ),
+                cumulative_llm_token_count_completion_details_reasoning=(
+                    cumulative_llm_token_count_completion_details_reasoning
+                ),
+                cumulative_llm_token_count_completion_details_audio=(
+                    cumulative_llm_token_count_completion_details_audio
+                ),
+                llm_token_count_total=token_counts.total,
+                llm_token_count_prompt=token_counts.prompt,
+                llm_token_count_completion=token_counts.completion,
             ),
             dialect=dialect,
             table=models.Span,
@@ -188,10 +211,32 @@ async def insert_span(
         .where(models.Span.id.in_(select(ancestors.c.id)))
         .values(
             cumulative_error_count=models.Span.cumulative_error_count + cumulative_error_count,
+            cumulative_llm_token_count_total=models.Span.cumulative_llm_token_count_total
+            + cumulative_llm_token_count_total,
             cumulative_llm_token_count_prompt=models.Span.cumulative_llm_token_count_prompt
             + cumulative_llm_token_count_prompt,
             cumulative_llm_token_count_completion=models.Span.cumulative_llm_token_count_completion
             + cumulative_llm_token_count_completion,
+            cumulative_llm_token_count_prompt_details_cache_read=(
+                models.Span.cumulative_llm_token_count_prompt_details_cache_read
+                + cumulative_llm_token_count_prompt_details_cache_read
+            ),
+            cumulative_llm_token_count_prompt_details_cache_write=(
+                models.Span.cumulative_llm_token_count_prompt_details_cache_write
+                + cumulative_llm_token_count_prompt_details_cache_write
+            ),
+            cumulative_llm_token_count_prompt_details_audio=(
+                models.Span.cumulative_llm_token_count_prompt_details_audio
+                + cumulative_llm_token_count_prompt_details_audio
+            ),
+            cumulative_llm_token_count_completion_details_reasoning=(
+                models.Span.cumulative_llm_token_count_completion_details_reasoning
+                + cumulative_llm_token_count_completion_details_reasoning
+            ),
+            cumulative_llm_token_count_completion_details_audio=(
+                models.Span.cumulative_llm_token_count_completion_details_audio
+                + cumulative_llm_token_count_completion_details_audio
+            ),
         )
     )
     return SpanInsertionEvent(project_rowid, span_rowid, trace.id)

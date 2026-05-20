@@ -198,10 +198,22 @@ class SpanIOValue:
 class TokenUsage:
     prompt: int = 0
     completion: int = 0
+    total: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    prompt_audio: int = 0
+    reasoning: int = 0
+    completion_audio: int = 0
 
     def __post_init__(self) -> None:
         assert self.prompt >= 0, "prompt must be non-negative"
         assert self.completion >= 0, "completion must be non-negative"
+        assert self.total >= 0, "total must be non-negative"
+        assert self.cache_read >= 0, "cache_read must be non-negative"
+        assert self.cache_write >= 0, "cache_write must be non-negative"
+        assert self.prompt_audio >= 0, "prompt_audio must be non-negative"
+        assert self.reasoning >= 0, "reasoning must be non-negative"
+        assert self.completion_audio >= 0, "completion_audio must be non-negative"
 
 
 ATTRIBUTE_PREFIX = "attributes."
@@ -215,6 +227,21 @@ class ComputedAttributes(Enum):
     CUMULATIVE_LLM_TOKEN_COUNT_TOTAL = "cumulative_token_count.total"
     CUMULATIVE_LLM_TOKEN_COUNT_PROMPT = "cumulative_token_count.prompt"
     CUMULATIVE_LLM_TOKEN_COUNT_COMPLETION = "cumulative_token_count.completion"
+    CUMULATIVE_LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ = (
+        "cumulative_token_count.prompt_details.cache_read"
+    )
+    CUMULATIVE_LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE = (
+        "cumulative_token_count.prompt_details.cache_write"
+    )
+    CUMULATIVE_LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO = (
+        "cumulative_token_count.prompt_details.audio"
+    )
+    CUMULATIVE_LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING = (
+        "cumulative_token_count.completion_details.reasoning"
+    )
+    CUMULATIVE_LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO = (
+        "cumulative_token_count.completion_details.audio"
+    )
     ERROR_COUNT = "error_count"
     CUMULATIVE_ERROR_COUNT = "cumulative_error_count"
 
@@ -222,6 +249,11 @@ class ComputedAttributes(Enum):
 class ComputedValues(NamedTuple):
     latency_ms: float
     cumulative_error_count: int
+    cumulative_llm_token_count_total: int
     cumulative_llm_token_count_prompt: int
     cumulative_llm_token_count_completion: int
-    cumulative_llm_token_count_total: int
+    cumulative_llm_token_count_prompt_details_cache_read: int
+    cumulative_llm_token_count_prompt_details_cache_write: int
+    cumulative_llm_token_count_prompt_details_audio: int
+    cumulative_llm_token_count_completion_details_reasoning: int
+    cumulative_llm_token_count_completion_details_audio: int

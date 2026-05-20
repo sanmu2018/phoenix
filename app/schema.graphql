@@ -3241,6 +3241,7 @@ type Span implements Node {
   tokenCountPrompt: Int
   tokenCountCompletion: Int
   tokenPromptDetails: TokenCountPromptDetails!
+  tokenCompletionDetails: TokenCountCompletionDetails!
   input: SpanIOValue
   output: SpanIOValue
   events: [SpanEvent!]!
@@ -3259,6 +3260,8 @@ type Span implements Node {
   Cumulative (completion) token count from self and all descendant spans (children, grandchildren, etc.)
   """
   cumulativeTokenCountCompletion: Float
+  cumulativeTokenPromptDetails: TokenCountPromptDetails!
+  cumulativeTokenCompletionDetails: TokenCountCompletionDetails!
 
   """
   Propagated status code that percolates up error status codes from descendant spans (children, grandchildren, etc.)
@@ -3605,6 +3608,11 @@ type TokenCountPromptDetails {
   audio: Int
 }
 
+type TokenCountCompletionDetails {
+  reasoning: Int
+  audio: Int
+}
+
 enum TokenKind {
   PROMPT
   COMPLETION
@@ -3627,6 +3635,11 @@ type TokenUsage {
   prompt: Float!
   completion: Float!
   total: Float!
+  cacheRead: Float!
+  cacheWrite: Float!
+  promptAudio: Float!
+  reasoning: Float!
+  completionAudio: Float!
 }
 
 type ToolCallChunk implements ChatCompletionSubscriptionPayload {

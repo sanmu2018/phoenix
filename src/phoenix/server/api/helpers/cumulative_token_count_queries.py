@@ -1,14 +1,14 @@
 """Batched aggregation queries for cumulative token counts.
 
-Both helpers sum `cumulative_llm_token_count_{prompt,completion}` from root
-spans (`Span.parent_id IS NULL`) and group by the requested key. SUM-and-GROUP-BY
+Both helpers sum cumulative token count columns from root spans
+(`Span.parent_id IS NULL`) and group by the requested key. SUM-and-GROUP-BY
 is required because a single trace may have multiple root spans, and a single
 session may have multiple traces — direct single-row reads would silently
 under-report. NULL columns coalesce to 0 so traces/sessions whose root spans
 have no LLM descendants return totals of 0 rather than NULL.
 
-Each helper returns a Select with three columns: `id_` (the grouping key),
-`prompt`, and `completion`.
+Each helper returns a Select with columns: `id_` (the grouping key), `prompt`,
+`completion`, `total`, and token detail totals.
 
 Callers must default missing keys to (0, 0). The GROUP BY emits no row for a
 key whose set of root spans is empty (e.g., a trace with no spans yet, or a
@@ -22,6 +22,14 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.sql.functions import coalesce
 
 from phoenix.db import models
+
+
+def _cumulative_total_expr() -> Any:
+    return coalesce(
+        func.nullif(models.Span.cumulative_llm_token_count_total, 0),
+        coalesce(models.Span.cumulative_llm_token_count_prompt, 0)
+        + coalesce(models.Span.cumulative_llm_token_count_completion, 0),
+    )
 
 
 def cumulative_token_counts_by_session(
@@ -38,6 +46,22 @@ def cumulative_token_counts_by_session(
             func.sum(coalesce(models.Span.cumulative_llm_token_count_completion, 0)).label(
                 "completion"
             ),
+            func.sum(_cumulative_total_expr()).label("total"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_prompt_details_cache_read, 0)
+            ).label("cache_read"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_prompt_details_cache_write, 0)
+            ).label("cache_write"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_prompt_details_audio, 0)
+            ).label("prompt_audio"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_completion_details_reasoning, 0)
+            ).label("reasoning"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_completion_details_audio, 0)
+            ).label("completion_audio"),
         )
         .join_from(models.Span, models.Trace)
         .where(models.Span.parent_id.is_(None))
@@ -60,6 +84,22 @@ def cumulative_token_counts_by_trace(
             func.sum(coalesce(models.Span.cumulative_llm_token_count_completion, 0)).label(
                 "completion"
             ),
+            func.sum(_cumulative_total_expr()).label("total"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_prompt_details_cache_read, 0)
+            ).label("cache_read"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_prompt_details_cache_write, 0)
+            ).label("cache_write"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_prompt_details_audio, 0)
+            ).label("prompt_audio"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_completion_details_reasoning, 0)
+            ).label("reasoning"),
+            func.sum(
+                coalesce(models.Span.cumulative_llm_token_count_completion_details_audio, 0)
+            ).label("completion_audio"),
         )
         .where(models.Span.parent_id.is_(None))
         .where(models.Span.trace_rowid.in_(keys))
